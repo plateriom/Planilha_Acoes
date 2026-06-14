@@ -1,7 +1,6 @@
 import yfinance as yf
 import gspread
 import pandas as pd
-import requests
 import random
 import time
 from datetime import datetime
@@ -13,41 +12,35 @@ SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 TICKERS_SHEET = "AÇÕES"
 DATA_SHEET = "Dados"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-]
-
 # ===================================================
 
-print("🚀 Iniciando versão melhorada...")
+print("🚀 Iniciando versão rápida (máscara leve)...")
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
 client = gspread.authorize(creds)
 spreadsheet = client.open_by_key(SHEET_ID)
 
+# Ler tickers
 sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
-tickers = [str(row[0]).strip().upper() for row in sheet_acoes.get_all_values()[1:] if row and str(row[0]).strip()]
+tickers = [str(row[0]).strip().upper() for row in sheet_acoes.get_all_values()[1:] 
+           if row and str(row[0]).strip()]
 tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
+print(f"✅ {len(tickers)} tickers encontrados")
 
 def get_fundamentals(ticker):
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    
-    for attempt in range(5):
+    for attempt in range(3):  # reduzido de 5 para 3
         try:
             t = yf.Ticker(f"{ticker}.SA")
             info = t.info
             
-            # Tentativa mais agressiva de pegar dividend yield
-            div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield') or None
+            div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
             
             margem = info.get('profitMargins')
             roe = info.get('returnOnEquity')
             pvp = info.get('priceToBook')
             
-            # Dívida/EBITDA mais robusto
+            # Dívida/EBITDA
             debt_ebitda = None
             try:
                 bal = t.balance_sheet
@@ -55,7 +48,7 @@ def get_fundamentals(ticker):
                 debt = bal.loc['Total Debt'].iloc[0] if not bal.empty and 'Total Debt' in bal.index else None
                 ebitda = fin.loc['EBITDA'].iloc[0] if not fin.empty and 'EBITDA' in fin.index else None
                 if debt is not None and ebitda and ebitda != 0:
-                    debt_ebitda = round(debt / ebitda, 2)
+                    debt_ebitda = round(float(debt) / float(ebitda), 2)
             except:
                 pass
 
@@ -70,18 +63,18 @@ def get_fundamentals(ticker):
                 "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
             }
         except:
-            time.sleep(7 + random.uniform(4, 12))
+            time.sleep(4 + random.uniform(0, 5))
     
     return {"Ticker": ticker, "Erro": "Sem dados"}
 
-# Execução
+# ================== EXECUÇÃO COM TEMPO CONTROLADO ==================
 dados = []
 for i, ticker in enumerate(tickers):
     print(f"[{i+1}/{len(tickers)}] {ticker}")
     dados.append(get_fundamentals(ticker))
-    time.sleep(6.5 + random.uniform(0, 3))
+    time.sleep(3.5 + random.uniform(0, 2))   # pausa bem menor
 
-# Limpar e enviar
+# Enviar para planilha
 df = pd.DataFrame(dados)
 df = df.replace([np.inf, -np.inf, float('nan')], None)
 
