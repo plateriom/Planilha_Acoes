@@ -52,4 +52,34 @@ def get_fundamentals(ticker):
             total_debt = balance.loc['Total Debt'].iloc[0] if not balance.empty and 'Total Debt' in balance.index else 0
             ebitda = financials.loc['EBITDA'].iloc[0] if not financials.empty and 'EBITDA' in financials.index else None
             div_ebitda = round(total_debt / ebitda, 2) if ebitda and ebitda != 0 else None
-        except
+        except:
+            div_ebitda = None
+        
+        return {
+            "Ticker": ticker,
+            "Margem Líquida (%)": round(margem_liquida * 100, 2) if margem_liquida else None,
+            "ROE (%)": round(roe * 100, 2) if roe else None,
+            "P/VP": round(pvp, 2) if pvp else None,
+            "Div Yield 12M (%)": round(div_yield * 100, 2) if div_yield else None,
+            "Dívida/EBITDA": div_ebitda,
+            "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
+        }
+    except Exception as e:
+        print(f"Erro ao buscar {ticker}: {e}")
+        return {"Ticker": ticker, "Erro": "Falha na busca"}
+
+# Buscar dados
+dados = []
+for i, ticker in enumerate(tickers):
+    print(f"Buscando {ticker}... ({i+1}/{len(tickers)})")
+    dados.append(get_fundamentals(ticker))
+    time.sleep(1.8)
+
+# Atualizar aba "dados"
+df = pd.DataFrame(dados)
+sheet_dados = spreadsheet.worksheet(DATA_SHEET)
+
+sheet_dados.clear()
+sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
+
+print("✅ Atualização concluída com sucesso na aba 'dados'!")
