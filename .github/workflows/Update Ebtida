@@ -1,0 +1,29 @@
+name: Atualizar Dívida/EBITDA
+
+on:
+  schedule:
+    - cron: '30 22 * * *'     # Roda todo dia às 22:30 UTC (19:30 BR) - 30 minutos depois do principal
+  workflow_dispatch:          # Permite rodar manualmente
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Criar credentials.json
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: Executar atualização de Dívida/EBITDA
+        run: python update_divida_ebitda.py
