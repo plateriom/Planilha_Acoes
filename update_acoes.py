@@ -8,8 +8,8 @@ import time
 # ================== CONFIGURAÇÕES ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 
-TICKERS_SHEET = "AÇÕES"      # Nome exato da aba
-DATA_SHEET = "dados"
+TICKERS_SHEET = "AÇÕES"
+DATA_SHEET = "Dados"          # ← Mude aqui se o nome for diferente
 
 # ===================================================
 
@@ -21,22 +21,28 @@ creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
 client = gspread.authorize(creds)
 spreadsheet = client.open_by_key(SHEET_ID)
 
-# Ler tickers da aba AÇÕES - Coluna A
+# Debug: Mostra todas as abas existentes
+print("Abas existentes na planilha:")
+for ws in spreadsheet.worksheets():
+    print(f" → '{ws.title}'")
+
+# Ler tickers
 sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
 tickers_data = sheet_acoes.get_all_values()
 
 tickers = []
-for row in tickers_data[1:]:           # pula cabeçalho
+for row in tickers_data[1:]:
     if row and len(row) > 0:
         ticker = str(row[0]).strip().upper()
         if ticker and ticker not in tickers and len(ticker) > 1:
             tickers.append(ticker)
 
-print(f"✅ Encontrados {len(tickers)} tickers na aba AÇÕES")
+print(f"✅ Encontrados {len(tickers)} tickers")
 
 # Função para buscar dados
 def get_fundamentals(ticker):
     try:
+        print(f"Buscando {ticker}...")
         t = yf.Ticker(f"{ticker}.SA")
         info = t.info
         
@@ -65,21 +71,25 @@ def get_fundamentals(ticker):
             "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
         }
     except Exception as e:
-        print(f"Erro ao buscar {ticker}: {e}")
-        return {"Ticker": ticker, "Erro": "Falha na busca"}
+        print(f"❌ Erro em {ticker}: {e}")
+        return {"Ticker": ticker, "Erro": str(e)}
 
-# Buscar dados
+# Buscar dados com pausa maior
 dados = []
 for i, ticker in enumerate(tickers):
-    print(f"Buscando {ticker}... ({i+1}/{len(tickers)})")
     dados.append(get_fundamentals(ticker))
-    time.sleep(1.8)
+    time.sleep(3.5)   # pausa maior para evitar rate limit
 
-# Atualizar aba "dados"
+# Atualizar aba de destino
+try:
+    sheet_Dados = spreadsheet.worksheet(DATA_SHEET)
+except Exception as e:
+    print(f"❌ Erro ao encontrar aba '{DATA_SHEET}': {e}")
+    print("Use o nome exato que apareceu na lista de abas acima.")
+    raise
+
 df = pd.DataFrame(dados)
-sheet_dados = spreadsheet.worksheet(DATA_SHEET)
+sheet_Dados.clear()
+sheet_Dados.update([df.columns.values.tolist()] + df.values.tolist())
 
-sheet_dados.clear()
-sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
-
-print("✅ Atualização concluída com sucesso na aba 'dados'!")
+print("✅ Atualização concluída com sucesso!")
