@@ -1,0 +1,31 @@
+name: Atualizar Planilha de Ações
+
+on:
+  schedule:
+    - cron: '0 22 * * *'     # Todo dia às 22:00 UTC (19h Brasília)
+  workflow_dispatch:         # Permite rodar manualmente
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Criar credentials.json
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: Executar script
+        run: python update_acoes.py
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
