@@ -6,12 +6,13 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 import time
 import random
+import numpy as np
 
 # ================== CONFIGURAÇÕES ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 
 TICKERS_SHEET = "AÇÕES"
-DATA_SHEET = "Dados"          # Nome exato corrigido
+DATA_SHEET = "Dados"
 
 # ===================================================
 
@@ -31,9 +32,9 @@ tickers = [str(row[0]).strip().upper() for row in sheet_acoes.get_all_values()[1
 tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
 print(f"✅ Encontrados {len(tickers)} tickers")
 
-# ================== BUSCA COM FALLBACK ==================
+# ================== FUNÇÃO COM FALLBACK ==================
 def get_fundamentals(ticker):
-    # Tenta primeiro no Yahoo
+    # Tenta Yahoo primeiro
     for tentativa in range(3):
         try:
             t = yf.Ticker(f"{ticker}.SA")
@@ -50,30 +51,26 @@ def get_fundamentals(ticker):
                 fin = t.financials
                 debt = bal.loc['Total Debt'].iloc[0] if not bal.empty and 'Total Debt' in bal.index else 0
                 ebitda = fin.loc['EBITDA'].iloc[0] if not fin.empty and 'EBITDA' in fin.index else None
-                div_ebitda = round(debt / ebitda, 2) if ebitda else None
+                div_ebitda = round(debt / ebitda, 2) if ebitda and ebitda != 0 else None
             except:
                 div_ebitda = None
 
             return {
                 "Ticker": ticker,
-                "Margem Líquida (%)": round(margem * 100, 2) if margem else None,
-                "ROE (%)": round(roe * 100, 2) if roe else None,
-                "P/VP": round(pvp, 2) if pvp else None,
-                "Div Yield 12M (%)": round(div_yield * 100, 2) if div_yield else None,
+                "Margem Líquida (%)": round(margem * 100, 2) if margem is not None else None,
+                "ROE (%)": round(roe * 100, 2) if roe is not None else None,
+                "P/VP": round(pvp, 2) if pvp is not None else None,
+                "Div Yield 12M (%)": round(div_yield * 100, 2) if div_yield is not None else None,
                 "Dívida/EBITDA": div_ebitda,
                 "Fonte": "Yahoo",
                 "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
             }
-        except Exception as e:
-            if "Too Many Requests" in str(e):
-                time.sleep(8 + random.uniform(0, 6))
-            else:
-                time.sleep(4)
+        except:
+            time.sleep(7 + random.uniform(0, 4))
     
-    # FALLBACK: brapi.dev (muito bom para ações brasileiras)
+    # Fallback brapi
     try:
-        print(f"  → Tentando fallback brapi para {ticker}")
-        r = requests.get(f"https://brapi.dev/api/quote/{ticker}", timeout=10)
+        r = requests.get(f"https://brapi.dev/api/quote/{ticker}", timeout=12)
         if r.status_code == 200:
             data = r.json().get('results', [{}])[0]
             return {
@@ -89,18 +86,21 @@ def get_fundamentals(ticker):
     except:
         pass
     
-    return {"Ticker": ticker, "Erro": "Sem dados (rate limit)"}
+    return {"Ticker": ticker, "Erro": "Sem dados"}
 
-# ================== EXECUÇÃO ==================
+# Buscar todos
 dados = []
 for i, ticker in enumerate(tickers):
     dados.append(get_fundamentals(ticker))
-    time.sleep(6)  # pausa segura
+    time.sleep(6.5)
+
+# ================== LIMPA NaN ANTES DE ENVIAR ==================
+df = pd.DataFrame(dados)
+df = df.replace([np.inf, -np.inf], None)
+df = df.where(pd.notnull(df), None)
 
 # Atualizar planilha
-df = pd.DataFrame(dados)
 sheet_dados = spreadsheet.worksheet(DATA_SHEET)
-
 sheet_dados.clear()
 sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
 
