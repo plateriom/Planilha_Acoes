@@ -12,27 +12,25 @@ SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 TICKERS_SHEET = "AÇÕES"
 DATA_SHEET = "Dados"
 
-# ===================================================
-
-print("🚀 Iniciando versão ULTRA RÁPIDA...")
+print("🚀 Iniciando atualização (versão anti-erro de injeção)...")
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
 client = gspread.authorize(creds)
 spreadsheet = client.open_by_key(SHEET_ID)
+sheet = spreadsheet.worksheet(DATA_SHEET)
 
-# Ler tickers
-sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
-tickers = [str(row[0]).strip().upper() for row in sheet_acoes.get_all_values()[1:] 
-           if row and str(row[0]).strip()]
+# ================== LER TICKERS ==================
+tickers_data = sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET).get_all_values()
+tickers = [str(row[0]).strip().upper() for row in tickers_data[1:] if row and str(row[0]).strip()]
 tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
-print(f"✅ {len(tickers)} tickers")
+print(f"✅ {len(tickers)} tickers encontrados")
 
+# ================== BUSCA ==================
 def get_fundamentals(ticker):
     try:
         t = yf.Ticker(f"{ticker}.SA")
         info = t.info
-        
         div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
         
         return {
@@ -41,26 +39,30 @@ def get_fundamentals(ticker):
             "ROE (%)": round(info.get('returnOnEquity', 0) * 100, 2),
             "P/VP": round(info.get('priceToBook', 0), 2),
             "Div Yield 12M (%)": round(div_yield * 100, 2) if div_yield else None,
-            "Dívida/EBITDA": None,   # Temporariamente desativado (muito lento)
-            "Fonte": "Yahoo Rápido",
+            "Fonte": "Yahoo",
             "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
         }
     except:
-        return {"Ticker": ticker, "Erro": "Falha"}
+        return {"Ticker": ticker, "Erro": "Falha na busca"}
 
-# Execução RÁPIDA
+# Busca dos dados
 dados = []
 for i, ticker in enumerate(tickers):
     print(f"[{i+1}/{len(tickers)}] {ticker}")
     dados.append(get_fundamentals(ticker))
-    time.sleep(2.2 + random.uniform(0, 1.5))   # pausa mínima
+    time.sleep(2.8 + random.uniform(0, 1.5))
 
-# Enviar
+# ================== LIMPEZA FORÇADA E INJEÇÃO ==================
 df = pd.DataFrame(dados)
 df = df.replace([np.inf, -np.inf, float('nan')], None)
 
-sheet_dados = spreadsheet.worksheet(DATA_SHEET)
-sheet_dados.clear()
-sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
+# LIMPA TUDO ANTES DE INJETAR (mais confiável)
+sheet.clear()
 
-print("✅ Concluído em modo rápido!")
+# Insere cabeçalho + dados de uma vez
+header = [df.columns.tolist()]
+values = df.values.tolist()
+
+sheet.update(range_name="A1", values=header + values, value_input_option='RAW')
+
+print("✅ Atualização concluída com sucesso (limpeza + injeção forçada)")
