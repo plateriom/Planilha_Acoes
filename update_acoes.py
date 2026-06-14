@@ -64,3 +64,7 @@ sheet_dados.clear()
 sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
 
 print("✅ Concluído em modo rápido!")
+
+# Temporário: atualiza também Dívida/EBITDA
+import subprocess
+subprocess.run(["python", "update_divida_ebitda.py"])
