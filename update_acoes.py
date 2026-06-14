@@ -8,9 +8,8 @@ import time
 # ================== CONFIGURAÇÕES ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 
-# Nome das abas
-TICKERS_SHEET = "açoes"      # Onde estão os tickers
-DATA_SHEET = "dados"         # Onde vamos injetar os dados
+TICKERS_SHEET = "açoes"
+DATA_SHEET = "dados"
 
 # ===================================================
 
@@ -24,7 +23,6 @@ def get_fundamentals(ticker):
         pvp = info.get('priceToBook')
         div_yield = info.get('trailingAnnualDividendYield')
         
-        # Dívida / EBITDA
         try:
             balance = t.balance_sheet
             financials = t.financials
@@ -53,24 +51,29 @@ def get_fundamentals(ticker):
 # ================== EXECUÇÃO ==================
 print("🚀 Iniciando atualização...")
 
-# Autenticação
-creds = Credentials.from_service_account_file('credentials.json')
+# === AUTENTICAÇÃO CORRIGIDA ===
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+
+creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
 client = gspread.authorize(creds)
+
 spreadsheet = client.open_by_key(SHEET_ID)
 
-# Ler tickers da aba "açoes" - Coluna A
+# Ler tickers da coluna A da aba "açoes"
 sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
 tickers_data = sheet_acoes.get_all_values()
 
-# Extrair tickers da coluna A (índice 0), ignorando cabeçalho
 tickers = []
-for row in tickers_data[1:]:  # pula a primeira linha (cabeçalho)
+for row in tickers_data[1:]:
     if row and len(row) > 0:
-        ticker = row[0].strip().upper()  # Coluna A = índice 0
+        ticker = str(row[0]).strip().upper()
         if ticker and ticker not in tickers and len(ticker) > 1:
             tickers.append(ticker)
 
-print(f"✅ Encontrados {len(tickers)} tickers na coluna A da aba 'açoes'")
+print(f"✅ Encontrados {len(tickers)} tickers")
 
 # Buscar dados
 dados = []
@@ -86,4 +89,4 @@ sheet_dados = spreadsheet.worksheet(DATA_SHEET)
 sheet_dados.clear()
 sheet_dados.update([df.columns.values.tolist()] + df.values.tolist())
 
-print("✅ Atualização concluída com sucesso na aba 'dados'!")
+print("✅ Atualização concluída com sucesso!")
