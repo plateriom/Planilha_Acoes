@@ -4,7 +4,7 @@ import numpy as np
 import time
 import random
 import json
-(e in text_upper for e in evidencias):import threading
+import threading
         return True
 
     log_ticker(
