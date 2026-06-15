@@ -5,167 +5,219 @@ import numpy as np
 import time
 import random
 import json
-import os
-import requests
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
-import google.auth.transport.urllib3 # <--- Força o Google a usar transporte isolado
+import os
+import requests  # <--- IMPORTANTE: Adicionado para gerenciar as sessões anti-bloqueio
 
 # ================== CONFIG ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 TICKERS_SHEET = "AÇÕES"
 DATA_SHEET = "Dados"
 
-MAX_RETRIES = 3
+MAX_WORKERS = 3
+MAX_RETRIES = 4
+RATE_LIMIT = 2.2  # intervalo global entre chamadas
 CACHE_FILE = "cache_fundamentals.json"
 CACHE_TTL = 60 * 60 * 6  # 6h
 
 SCOPES = [
-    'https://googleapis.com',
-    'https://googleapis.com'
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
 ]
 
+# ================== LOG ==================
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ================== FUNÇÃO PARA CONEXÃO COM O GOOGLE ==================
-def conectar_google_sheets(nome_aba):
-    """Autentica isolando o transporte para o requests não estragar o login."""
-    json_env = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    
-    if not json_env:
-        if os.path.exists('credentials.json'):
-            with open('credentials.json', 'r') as f:
-                info_credenciais = json.load(f)
-        else:
-            raise ValueError("Credenciais do Google não encontradas.")
-    else:
-        info_credenciais = json.loads(json_env)
+# ================== AUTH ==================
+creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+client = gspread.authorize(creds)
 
-    creds = Credentials.from_service_account_info(info_credenciais, scopes=SCOPES)
-    
-    # ISSO AQUI BLINDA O LOGIN: Força o gspread a autenticar via urllib3 pura,
-    # ignorando qualquer alteração que o requests/yfinance façam no ambiente global.
-    http_client = google.auth.transport.urllib3.AuthorizedHttp(creds)
-    client = gspread.Client(auth=creds, http_client=http_client)
-    
-    spreadsheet = client.open_by_key(SHEET_ID)
-    return spreadsheet.worksheet(nome_aba)
+spreadsheet = client.open_by_key(SHEET_ID)
+sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
+sheet_dados = spreadsheet.worksheet(DATA_SHEET)
 
-# ================== FUNÇÃO PARA GERAR SESSÃO ISOLADA ==================
-def criar_sessao_yahoo():
-    sessao = requests.Session()
-    sessao.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive'
-    })
-    return sessao
+# ================== RATE LIMIT GLOBAL ==================
+lock = threading.Lock()
+last_call = [0]
 
-# ================== SISTEMA DE CACHE ==================
+def rate_limiter():
+    with lock:
+        now = time.time()
+        elapsed = now - last_call[0]
+
+        if elapsed < RATE_LIMIT:
+            time.sleep(RATE_LIMIT - elapsed)
+
+        last_call[0] = time.time()
+
+# ================== CACHE ==================
 def load_cache():
-    if not os.path.exists(CACHE_FILE): return {}
-    with open(CACHE_FILE, "r") as f: return json.load(f)
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    with open(CACHE_FILE, "r") as f:
+        return json.load(f)
 
 def save_cache(cache):
-    with open(CACHE_FILE, "w") as f: json.dump(cache, f)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
 
 cache = load_cache()
 
 def get_cached(ticker):
     data = cache.get(ticker)
-    if not data: return None
-    if time.time() - data.get("timestamp", 0) > CACHE_TTL: return None
+    if not data:
+        return None
+
+    timestamp = data.get("timestamp", 0)
+    if time.time() - timestamp > CACHE_TTL:
+        return None
+
     return data.get("payload")
 
 def set_cache(ticker, payload):
-    cache[ticker] = {"timestamp": time.time(), "payload": payload}
-    save_cache(cache)
+    cache[ticker] = {
+        "timestamp": time.time(),
+        "payload": payload
+    }
+    save_cache(cache)  # <--- CORREÇÃO: Linha finalizada para garantir a gravação do cache
 
-# ================== BUSCA DE DADOS ==================
-def fetch_ticker_data(ticker):
-    cached_data = get_cached(ticker)
-    if cached_data:
-        log(f"[{ticker}] Dados recuperados do cache.")
-        return cached_data
+# ================== UTILS ==================
+def safe_percent(v):
+    return round(v * 100, 2) if isinstance(v, (int, float)) else None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+def safe_round(v):
+    return round(v, 2) if isinstance(v, (int, float)) else None
+
+def sanitize(df):
+    return df.replace([np.inf, -np.inf, np.nan], None)
+
+# ================== LOAD TICKERS ==================
+def load_tickers():
+    values = sheet_acoes.get_all_values()
+
+    tickers = [
+        str(row[0]).strip().upper()
+        for row in values[1:]
+        if row and str(row[0]).strip()
+    ]
+
+    tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
+    return tickers
+
+# ================== FETCH ==================
+def fetch_ticker(ticker):
+    # CACHE
+    cached = get_cached(ticker)
+    if cached:
+        cached["Status"] = "CACHE"
+        return cached
+
+    for attempt in range(MAX_RETRIES):
         try:
-            wait_time = random.uniform(2.0, 4.0)
-            time.sleep(wait_time)
-            
-            log(f"[{ticker}] Buscando... (Tentativa {attempt}/{MAX_RETRIES})")
-            
-            sessao_exclusiva = criar_sessao_yahoo()
-            t = yf.Ticker(ticker, session=sessao_exclusiva)
-            info = t.info
-            
-            if not info or len(info) <= 1:
-                raise ValueError("Resposta vazia da API.")
+            rate_limiter()
 
-            payload = {
+            # MODIFICAÇÃO ANTI-BLOQUEIO: Cria uma sessão HTTP exclusiva por thread
+            # simulando um navegador real, evitando bloqueio do Yahoo Finance.
+            sessao = requests.Session()
+            sessao.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
+            })
+
+            # Injeta a sessão de forma isolada dentro da instância do Ticker
+            t = yf.Ticker(f"{ticker}.SA", session=sessao)
+            info = t.info
+
+            div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
+
+            data = {
                 "Ticker": ticker,
-                "Preço": info.get("currentPrice", np.nan),
-                "P/L": info.get("trailingPE", np.nan),
-                "P/VP": info.get("priceToBook", np.nan),
-                "DY (%)": (info.get("dividendYield", 0) or 0) * 100 if info.get("dividendYield") else np.nan,
-                "ROE (%)": (info.get("returnOnEquity", 0) or 0) * 100 if info.get("returnOnEquity") else np.nan,
-                "Margem Líq (%)": (info.get("profitMargins", 0) or 0) * 100 if info.get("profitMargins") else np.nan,
-                "EV/EBITDA": info.get("enterpriseToEbitda", np.nan)
+                "Margem Líquida (%)": safe_percent(info.get('profitMargins')),
+                "ROE (%)": safe_percent(info.get('returnOnEquity')),
+                "P/VP": safe_round(info.get('priceToBook')),
+                "Div Yield 12M (%)": safe_percent(div_yield),
+                "Fonte": "Yahoo",
+                "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                "Status": "OK"
             }
-            
-            set_cache(ticker, payload)
-            return payload
+
+            set_cache(ticker, data)
+            return data
 
         except Exception as e:
-            log(f"[{ticker}] Erro: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(4 * attempt)
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = (3 ** attempt) + random.uniform(1, 2)
+                log(f"{ticker} retry {attempt+1} em {round(sleep_time,1)}s")
+                time.sleep(sleep_time)
             else:
-                log(f"[{ticker}] Falha definitiva.")
-                
-    return {"Ticker": ticker, "Preço": np.nan, "P/L": np.nan, "P/VP": np.nan, "DY (%)": np.nan, "ROE (%)": np.nan, "Margem Líq (%)": np.nan, "EV/EBITDA": np.nan}
+                return {
+                    "Ticker": ticker,
+                    "Status": "ERRO",
+                    "Erro": str(e)
+                }
 
-# ================== EXECUÇÃO PRINCIPAL ==================
+# ================== PARALLEL ==================
+def fetch_all(tickers):
+    results = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_ticker, t) for t in tickers]
+
+        for i, future in enumerate(as_completed(futures)):
+            try:
+                result = future.result()
+                results.append(result)
+                log(f"[{i+1}/{len(tickers)}] {result['Ticker']} ✅")
+            except Exception as e:
+                log(f"Falha crítica: {e}")
+
+    return results
+
+# ================== WRITE ==================
+def write_sheet(df):
+    df = sanitize(df)
+
+    data = [df.columns.tolist()] + df.values.tolist()
+
+    # NÃO apaga tudo cegamente → mais seguro
+    sheet_dados.batch_clear(["A1:Z1000"])
+
+    sheet_dados.update(
+        range_name="A1",
+        values=data,
+        value_input_option="RAW"
+    )
+
+# ================== MAIN ==================
 def main():
-    start_time = time.time()
-    log("Iniciando atualização diária...")
+    start = time.time()
 
-    log("Lendo tickers da planilha...")
-    sheet_acoes = conectar_google_sheets(TICKERS_SHEET)
-    coluna_tickers = sheet_acoes.col_values(1)
-    tickers = [t.strip().upper() for t in coluna_tickers[1:] if t.strip()]
-    
+    log("Carregando tickers...")
+    tickers = load_tickers()
+
     if not tickers:
-        log("Nenhum ticker encontrado na aba AÇÕES.")
+        log("Nenhum ticker encontrado")
         return
 
-    log(f"Processando {len(tickers)} ativos sequencialmente fora da conexão do Sheets...")
+    log(f"{len(tickers)} ativos")
 
-    results = []
-    for ticker in tickers:
-        res = fetch_ticker_data(ticker)
-        results.append(res)
+    results = fetch_all(tickers)
 
-    df_resultado = pd.DataFrame(results)
-    df_resultado['Ticker'] = pd.Categorical(df_resultado['Ticker'], categories=tickers, ordered=True)
-    df_resultado = df_resultado.sort_values('Ticker').reset_index(drop=True)
-    df_resultado = df_resultado.replace([np.inf, -np.inf], np.nan).fillna("")
+    df = pd.DataFrame(results)
 
-    header = df_resultado.columns.tolist()
-    rows = df_resultado.values.tolist()
-    data_to_write = [header] + rows
+    log("Gravando na planilha...")
+    write_sheet(df)
 
-    log(f"Abrindo nova conexão para gravar dados na aba '{DATA_SHEET}'...")
-    sheet_dados = conectar_google_sheets(DATA_SHEET)
-    sheet_dados.clear()
-    
-    end_col = chr(64 + len(header)) if len(header) <= 26 else "Z"
-    cell_range = f"A1:{end_col}{len(data_to_write)}"
-    sheet_dados.update(range_name=cell_range, values=data_to_write)
-    
-    log(f"Finalizado em {time.time() - start_time:.2f} segundos!")
+    save_cache(cache)
 
+    elapsed = round(time.time() - start, 2)
+    log(f"Finalizado em {elapsed}s")
+
+# ================== RUN ==================
 if __name__ == "__main__":
     main()
