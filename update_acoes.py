@@ -34,8 +34,9 @@ RATE_LIMIT = 2.2
 
 CACHE_FILE = "cache_fundamentals.json"
 CACHE_TTL = 60 * 60 * 6  # 6 horas
+CACHE_SCHEMA_VERSION = 2  # versão com Preço Atual
 
-MIN_VALID_FIELDS = 3
+MIN_VALID_FIELDS = 4
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -44,6 +45,7 @@ SCOPES = [
 
 COLUMNS = [
     "Ticker",
+    "Preço Atual",
     "Margem Líquida (%)",
     "ROE (%)",
     "P/VP",
@@ -74,10 +76,6 @@ def log_ticker(ticker, fonte, status, detalhe=""):
 # ================== JSON / SHEETS SAFETY ==================
 
 def clean_for_json(value):
-    """
-    Remove NaN, inf, -inf, pd.NA e tipos numpy antes de enviar ao Google Sheets
-    ou salvar no cache.
-    """
     if value is None:
         return None
 
@@ -114,10 +112,6 @@ def clean_for_json(value):
 
 
 def validate_json_safe(data):
-    """
-    Valida antes de limpar a planilha.
-    Se ainda houver NaN/inf, falha aqui antes de apagar qualquer coisa.
-    """
     json.dumps(data, allow_nan=False)
 
 
@@ -193,14 +187,25 @@ def get_cached(ticker):
     if not data:
         return None
 
+    schema_version = data.get("schema_version", 1)
+
+    if schema_version < CACHE_SCHEMA_VERSION:
+        log_ticker(ticker, "CACHE", "IGNORADO", "cache antigo sem Preço Atual")
+        return None
+
     timestamp = data.get("timestamp", 0)
 
     if time.time() - timestamp > CACHE_TTL:
+        log_ticker(ticker, "CACHE", "EXPIRADO")
         return None
 
     payload = data.get("payload")
 
     if not payload:
+        return None
+
+    if "Preço Atual" not in payload or payload.get("Preço Atual") is None:
+        log_ticker(ticker, "CACHE", "IGNORADO", "payload sem Preço Atual")
         return None
 
     result = dict(payload)
@@ -217,6 +222,7 @@ def set_cache(ticker, payload):
 
     with cache_lock:
         cache[ticker] = {
+            "schema_version": CACHE_SCHEMA_VERSION,
             "timestamp": time.time(),
             "payload": payload_to_save
         }
@@ -335,6 +341,29 @@ def extract_metric(text, label):
     return parse_br_number(match.group(1))
 
 
+def extract_price_investidor10(text, ticker):
+    ticker = ticker.upper().strip()
+
+    number_pattern = r"(-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+|-?\d+(?:\.\d+)?)"
+
+    patterns = [
+        rf"{re.escape(ticker)}\s+Cotação\s+R\$\s*{number_pattern}",
+        rf"Cotação\s+R\$\s*{number_pattern}",
+        rf"COTAÇÃO\s+{re.escape(ticker)}.*?R\$\s*{number_pattern}",
+        rf"Preço Atual\s+R\$\s*{number_pattern}",
+        rf"Preço\s+Atual\s+R\$\s*{number_pattern}"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I | re.S)
+        if match:
+            value = parse_br_number(match.group(1))
+            if value is not None and value > 0:
+                return value
+
+    return None
+
+
 def build_headers():
     return {
         "User-Agent": (
@@ -407,6 +436,7 @@ def fetch_investidor10(ticker):
 
             data = {
                 "Ticker": ticker,
+                "Preço Atual": extract_price_investidor10(text, ticker),
                 "Margem Líquida (%)": extract_metric(text, "Margem Líquida"),
                 "ROE (%)": extract_metric(text, "ROE"),
                 "P/VP": extract_metric(text, "P/VP"),
@@ -462,7 +492,6 @@ def fetch_investidor10(ticker):
         except Exception as e:
             last_error = str(e)
 
-            # HTTP 410/404 normalmente é permanente. Não adianta insistir.
             if "HTTP 410" in last_error or "não encontrado" in last_error:
                 log_ticker(
                     ticker,
@@ -494,6 +523,37 @@ def fetch_investidor10(ticker):
 
 # ================== YAHOO FALLBACK ==================
 
+def get_yahoo_price(ticker_obj, info):
+    candidates = [
+        info.get("currentPrice"),
+        info.get("regularMarketPrice"),
+        info.get("previousClose")
+    ]
+
+    for value in candidates:
+        parsed = safe_round(value)
+        if parsed is not None and parsed > 0:
+            return parsed
+
+    try:
+        fast_info = ticker_obj.fast_info
+
+        for key in ["last_price", "lastPrice", "regular_market_price"]:
+            try:
+                value = fast_info.get(key)
+            except Exception:
+                value = None
+
+            parsed = safe_round(value)
+            if parsed is not None and parsed > 0:
+                return parsed
+
+    except Exception:
+        pass
+
+    return None
+
+
 def fetch_yahoo(ticker):
     last_error = None
 
@@ -518,6 +578,7 @@ def fetch_yahoo(ticker):
 
             data = {
                 "Ticker": ticker,
+                "Preço Atual": get_yahoo_price(t, info),
                 "Margem Líquida (%)": safe_percent(info.get("profitMargins")),
                 "ROE (%)": safe_percent(info.get("returnOnEquity")),
                 "P/VP": safe_round(info.get("priceToBook")),
@@ -605,7 +666,7 @@ def fetch_ticker(ticker):
             ticker,
             "CACHE",
             "OK",
-            f"fonte original: {cached.get('Fonte')}"
+            f"fonte original: {cached.get('Fonte')} | preço: {cached.get('Preço Atual')}"
         )
         return normalize_result(cached)
 
@@ -613,7 +674,6 @@ def fetch_ticker(ticker):
     best_partial_count = 0
     errors = []
 
-    # 1) Fonte principal: Investidor10
     i10_data, i10_count, i10_error = fetch_investidor10(ticker)
 
     if i10_data and i10_count >= MIN_VALID_FIELDS:
@@ -634,7 +694,6 @@ def fetch_ticker(ticker):
         "Investidor10 insuficiente ou indisponível"
     )
 
-    # 2) Fallback: Yahoo
     yahoo_data, yahoo_count, yahoo_error = fetch_yahoo(ticker)
 
     if yahoo_data and yahoo_count >= MIN_VALID_FIELDS:
@@ -648,7 +707,6 @@ def fetch_ticker(ticker):
     if yahoo_error:
         errors.append(f"Yahoo: {yahoo_error}")
 
-    # 3) Se tiver dado real parcial, grava parcial
     if best_partial and best_partial_count > 0:
         best_partial["Status"] = "PARCIAL"
         best_partial["Erro"] = " | ".join(errors) if errors else "dados parciais"
@@ -665,7 +723,6 @@ def fetch_ticker(ticker):
         set_cache(ticker, best_partial)
         return normalize_result(best_partial)
 
-    # 4) Se nada deu certo, retorna erro fail-safe
     error_msg = " | ".join(errors) if errors else "nenhuma fonte retornou dados reais"
 
     log_ticker(
@@ -677,6 +734,7 @@ def fetch_ticker(ticker):
 
     return normalize_result({
         "Ticker": ticker,
+        "Preço Atual": None,
         "Fonte": None,
         "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
         "Status": "ERRO",
@@ -701,10 +759,11 @@ def fetch_all(tickers):
                 ticker = result.get("Ticker", "DESCONHECIDO")
                 status = result.get("Status", "SEM_STATUS")
                 fonte = result.get("Fonte", "SEM_FONTE")
+                preco = result.get("Preço Atual", None)
 
                 log(
                     f"PROGRESSO [{i + 1}/{len(tickers)}] "
-                    f"{ticker} | {status} | {fonte}"
+                    f"{ticker} | {status} | {fonte} | preço: {preco}"
                 )
 
             except Exception as e:
@@ -730,7 +789,7 @@ def write_sheet(df):
     log("PLANILHA | limpando intervalo A1:Z1000")
     sheet_dados.batch_clear(["A1:Z1000"])
 
-    log(f"PLANILHA | gravando {len(df)} linhas")
+    log(f"PLANILHA | gravando {len(df)} linhas e {len(COLUMNS)} colunas")
     sheet_dados.update(
         range_name="A1",
         values=data,
@@ -753,7 +812,9 @@ def main():
 
     log(f"TICKERS | {len(tickers)} ativos encontrados")
     log("ORDEM DE FONTES | 1º Investidor10 | 2º Yahoo | 3º ERRO/PARCIAL fail-safe")
+    log("NOVA COLUNA | Preço Atual será buscado junto dos fundamentos")
     log(f"CACHE | TTL configurado: {round(CACHE_TTL / 3600, 1)} horas")
+    log(f"CACHE | schema version exigido: {CACHE_SCHEMA_VERSION}")
     log(f"RATE LIMIT | intervalo global mínimo: {RATE_LIMIT}s")
     log(f"THREADS | max_workers: {MAX_WORKERS}")
 
@@ -773,6 +834,15 @@ def main():
             log(f"STATUS | {status}: {qtd}")
     except Exception as e:
         log(f"STATUS | erro ao gerar resumo: {e}")
+
+    try:
+        sem_preco = df[df["Preço Atual"].isna()]["Ticker"].tolist()
+        if sem_preco:
+            log(f"PREÇO | ativos sem preço capturado: {', '.join(sem_preco)}")
+        else:
+            log("PREÇO | todos os ativos com preço capturado")
+    except Exception as e:
+        log(f"PREÇO | erro ao validar preços: {e}")
 
     log("PLANILHA | gravando dados")
     write_sheet(df)
