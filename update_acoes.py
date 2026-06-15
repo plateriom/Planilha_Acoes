@@ -27,9 +27,16 @@ SCOPES = [
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
+# ================== FUNÇÃO PARA CONEXÃO COM O GOOGLE ==================
+def conectar_google_sheets(nome_aba):
+    """Abre uma conexão fresca com o Google Sheets somente quando necessário."""
+    creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(SHEET_ID)
+    return spreadsheet.worksheet(nome_aba)
+
 # ================== FUNÇÃO PARA GERAR SESSÃO ISOLADA ==================
 def criar_sessao_yahoo():
-    """Cria uma sessão HTTP nova e isolada apenas para o yfinance."""
     sessao = requests.Session()
     sessao.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -38,14 +45,6 @@ def criar_sessao_yahoo():
         'Connection': 'keep-alive'
     })
     return sessao
-
-# ================== AUTH (EXATAMENTE COMO NO SEU PRIMEIRO CÓDIGO) ==================
-creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-client = gspread.authorize(creds)
-
-spreadsheet = client.open_by_key(SHEET_ID)
-sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
-sheet_dados = spreadsheet.worksheet(DATA_SHEET)
 
 # ================== CACHE ==================
 def load_cache():
@@ -76,12 +75,12 @@ def fetch_ticker_data(ticker):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            wait_time = random.uniform(3.0, 6.0)
+            # Pausa humana curta para evitar bloqueio do IP
+            wait_time = random.uniform(2.0, 4.0)
             time.sleep(wait_time)
             
             log(f"[{ticker}] Buscando... (Tentativa {attempt}/{MAX_RETRIES})")
             
-            # Cria e usa uma sessão limpa e exclusiva para esta chamada do Yahoo
             sessao_exclusiva = criar_sessao_yahoo()
             t = yf.Ticker(ticker, session=sessao_exclusiva)
             info = t.info
@@ -106,7 +105,7 @@ def fetch_ticker_data(ticker):
         except Exception as e:
             log(f"[{ticker}] Erro: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(5 * attempt)
+                time.sleep(4 * attempt)
             else:
                 log(f"[{ticker}] Falha definitiva.")
                 
@@ -117,6 +116,9 @@ def main():
     start_time = time.time()
     log("Iniciando atualização diária...")
 
+    # Conexão rápida 1: Apenas lê os tickers e fecha
+    log("Lendo tickers da planilha...")
+    sheet_acoes = conectar_google_sheets(TICKERS_SHEET)
     coluna_tickers = sheet_acoes.col_values(1)
     tickers = [t.strip().upper() for t in coluna_tickers[1:] if t.strip()]
     
@@ -124,13 +126,15 @@ def main():
         log("Nenhum ticker encontrado.")
         return
 
-    log(f"Processando {len(tickers)} ativos sequencialmente...")
+    log(f"Processando {len(tickers)} ativos sequencialmente fora da conexão do Sheets...")
 
+    # Faz todo o processo demorado de raspagem do Yahoo localmente
     results = []
     for ticker in tickers:
         res = fetch_ticker_data(ticker)
         results.append(res)
 
+    # Processa os dados no Pandas
     df_resultado = pd.DataFrame(results)
     df_resultado['Ticker'] = pd.Categorical(df_resultado['Ticker'], categories=tickers, ordered=True)
     df_resultado = df_resultado.sort_values('Ticker').reset_index(drop=True)
@@ -140,7 +144,9 @@ def main():
     rows = df_resultado.values.tolist()
     data_to_write = [header] + rows
 
-    log(f"Gravando dados na aba '{DATA_SHEET}'...")
+    # Conexão rápida 2: Abre uma nova sessão autenticada fresca apenas para salvar os dados finais
+    log(f"Abrindo nova conexão para gravar dados na aba '{DATA_SHEET}'...")
+    sheet_dados = conectar_google_sheets(DATA_SHEET)
     sheet_dados.clear()
     
     end_col = chr(64 + len(header)) if len(header) <= 26 else "Z"
