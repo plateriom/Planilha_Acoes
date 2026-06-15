@@ -4,7 +4,96 @@ import numpy as np
 import time
 import random
 import json
-(value):import threading
+import threading
+import os
+import re
+import html as html_lib
+import requests
+import math
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.oauth2.service_account import Credentials
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+
+# ================== CONFIG ==================
+
+SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
+
+TICKERS_SHEET = "FIIs"
+DATA_SHEET = "FIIs Dados"
+
+MAX_WORKERS = 3
+MAX_RETRIES = 4
+RATE_LIMIT = 2.2
+
+CACHE_FILE = "cache_fiis.json"
+CACHE_TTL = 60 * 60 * 6
+CACHE_SCHEMA_VERSION = 3
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+COLUMNS = [
+    "Ticker",
+    "Preço Atual",
+    "Dividend Yield 12M (%)",
+    "Rendimentos 12M",
+    "P/VP",
+    "Último Rendimento",
+    "Fonte",
+    "Atualizado em",
+    "Status",
+    "Erro"
+]
+
+CLEAR_RANGE = "A1:AB1000"
+
+
+# ================== LOG ==================
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def log_ticker(ticker, fonte, status, detalhe=""):
+    detalhe_txt = f" | {detalhe}" if detalhe else ""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} | {fonte} | {status}{detalhe_txt}")
+
+
+# ================== JSON / SHEETS SAFETY ==================
+
+def clean_for_json(value):
+    if value is None:
+        return None
+
+    if value is pd.NA:
+        return None
+
+    if isinstance(value, dict):
+        return {str(k): clean_for_json(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, tuple):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, np.integer):
+        return int(value)
+
+    if isinstance(value, np.floating):
+        value = float(value)
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
             return None
         return value
 
@@ -16,6 +105,9 @@ import json
 
     return value
 
+
+def validate_json_safe(data):
+    json.dumps(data, allow_nan=False)
 
 def validate_json_safe(data):
     json.dumps(data, allow_nan=False)
