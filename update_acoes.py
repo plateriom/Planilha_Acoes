@@ -18,14 +18,29 @@ DATA_SHEET = "Dados"
 
 MAX_WORKERS = 3
 MAX_RETRIES = 4
-RATE_LIMIT = 2.2  # intervalo global entre chamadas
-CACHE_FILE = "cache_fundamentals.json"
-CACHE_TTL = 60 * 60 * 6  # 6h
+RATE_LIMIT = 2.2
+
+CACHE_FILE = "cache.json"
+CACHE_TTL = 21600  # 6h
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
+
+# ================== SETORES ==================
+SETOR_MAP = {
+    "BBAS3": "Bancos", "ITUB4": "Bancos",
+    "VALE3": "Commodities", "PETR4": "Commodities",
+    "WEGE3": "Industrial", "ABEV3": "Consumo",
+}
+
+PESO_SETOR = {
+    "Bancos": {"roe_min": 15, "pvp_max": 1.5},
+    "Commodities": {"roe_min": 10, "pvp_max": 2.0},
+    "Industrial": {"roe_min": 12, "pvp_max": 2.5},
+    "Consumo": {"roe_min": 10, "pvp_max": 3.0},
+}
 
 # ================== LOG ==================
 def log(msg):
@@ -39,18 +54,15 @@ spreadsheet = client.open_by_key(SHEET_ID)
 sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
 sheet_dados = spreadsheet.worksheet(DATA_SHEET)
 
-# ================== RATE LIMIT GLOBAL ==================
+# ================== RATE LIMIT ==================
 lock = threading.Lock()
 last_call = [0]
 
 def rate_limiter():
     with lock:
-        now = time.time()
-        elapsed = now - last_call[0]
-
+        elapsed = time.time() - last_call[0]
         if elapsed < RATE_LIMIT:
             time.sleep(RATE_LIMIT - elapsed)
-
         last_call[0] = time.time()
 
 # ================== CACHE ==================
@@ -67,21 +79,15 @@ def save_cache(cache):
 cache = load_cache()
 
 def get_cached(ticker):
-    data = cache.get(ticker)
-    if not data:
+    d = cache.get(ticker)
+    if not d:
         return None
-
-    timestamp = data.get("timestamp", 0)
-    if time.time() - timestamp > CACHE_TTL:
+    if time.time() - d["ts"] > CACHE_TTL:
         return None
+    return d["data"]
 
-    return data.get("payload")
-
-def set_cache(ticker, payload):
-    cache[ticker] = {
-        "timestamp": time.time(),
-        "payload": payload
-    }
+def set_cache(ticker, data):
+    cache[ticker] = {"ts": time.time(), "data": data}
 
 # ================== UTILS ==================
 def safe_percent(v):
@@ -93,22 +99,16 @@ def safe_round(v):
 def sanitize(df):
     return df.replace([np.inf, -np.inf, np.nan], None)
 
-# ================== LOAD TICKERS ==================
+# ================== LOAD ==================
 def load_tickers():
     values = sheet_acoes.get_all_values()
-
-    tickers = [
-        str(row[0]).strip().upper()
-        for row in values[1:]
-        if row and str(row[0]).strip()
-    ]
-
-    tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
-    return tickers
+    return list(dict.fromkeys([
+        str(r[0]).strip().upper()
+        for r in values[1:] if r and str(r[0]).strip()
+    ]))
 
 # ================== FETCH ==================
 def fetch_ticker(ticker):
-    # CACHE
     cached = get_cached(ticker)
     if cached:
         cached["Status"] = "CACHE"
@@ -121,17 +121,16 @@ def fetch_ticker(ticker):
             t = yf.Ticker(f"{ticker}.SA")
             info = t.info
 
-            div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
+            div = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
 
             data = {
                 "Ticker": ticker,
                 "Margem Líquida (%)": safe_percent(info.get('profitMargins')),
                 "ROE (%)": safe_percent(info.get('returnOnEquity')),
                 "P/VP": safe_round(info.get('priceToBook')),
-                "Div Yield 12M (%)": safe_percent(div_yield),
-                "Fonte": "Yahoo",
-                "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                "Status": "OK"
+                "Div Yield 12M (%)": safe_percent(div),
+                "Status": "OK",
+                "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
             }
 
             set_cache(ticker, data)
@@ -139,73 +138,124 @@ def fetch_ticker(ticker):
 
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
-                sleep_time = (3 ** attempt) + random.uniform(1, 2)
-                log(f"{ticker} retry {attempt+1} em {round(sleep_time,1)}s")
-                time.sleep(sleep_time)
+                time.sleep((3 ** attempt) + random.uniform(1, 2))
             else:
-                return {
-                    "Ticker": ticker,
-                    "Status": "ERRO",
-                    "Erro": str(e)
-                }
+                return {"Ticker": ticker, "Status": "ERRO", "Erro": str(e)}
 
-# ================== PARALLEL ==================
+# ================== ENGINE ==================
+def filtro(row):
+    return not (
+        row["ROE (%)"] is None or row["ROE (%)"] < 5 or
+        row["Margem Líquida (%)"] is None or row["Margem Líquida (%)"] < 0 or
+        row["P/VP"] is None
+    )
+
+def score_base(row):
+    score = 0
+    roe, margem, pvp, dy = row["ROE (%)"], row["Margem Líquida (%)"], row["P/VP"], row["Div Yield 12M (%)"]
+
+    if roe:
+        score += 20 if roe > 20 else 15 if roe > 15 else 10 if roe > 10 else 5
+
+    if margem:
+        score += 20 if margem > 20 else 15 if margem > 10 else 10 if margem > 5 else 0
+
+    if pvp:
+        score += 20 if pvp < 1 else 15 if pvp < 1.5 else 10 if pvp < 2 else -10 if pvp > 3 else 0
+
+    if dy:
+        score += 20 if dy > 8 else 15 if dy > 6 else 10 if dy > 4 else 0
+
+    return max(0, min(100, score))
+
+def ajuste_setor(row, score):
+    t = row["Ticker"]
+    setor = SETOR_MAP.get(t, "Outro")
+    regras = PESO_SETOR.get(setor, {})
+
+    roe, pvp = row["ROE (%)"], row["P/VP"]
+
+    if roe and roe >= regras.get("roe_min", 0):
+        score += 5
+    else:
+        score -= 5
+
+    if pvp and pvp <= regras.get("pvp_max", 10):
+        score += 5
+    else:
+        score -= 5
+
+    return max(0, min(100, score)), setor
+
+def momentum(ticker, score):
+    try:
+        d = yf.download(f"{ticker}.SA", period="3mo", progress=False)
+        if d.empty:
+            return score
+
+        d["mm21"] = d["Close"].rolling(21).mean()
+        d["mm50"] = d["Close"].rolling(50).mean()
+        last = d.iloc[-1]
+
+        if last["Close"] > last["mm21"] > last["mm50"]:
+            score += 10
+        elif last["Close"] < last["mm21"] < last["mm50"]:
+            score -= 15
+    except:
+        pass
+
+    return max(0, min(100, score))
+
+def decisao(score):
+    if score >= 80: return "COMPRAR FORTE"
+    if score >= 65: return "COMPRAR"
+    if score >= 45: return "MANTER"
+    if score >= 30: return "REDUZIR"
+    return "VENDER"
+
+# ================== EXEC ==================
 def fetch_all(tickers):
     results = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_ticker, t) for t in tickers]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(fetch_ticker, t) for t in tickers]
 
-        for i, future in enumerate(as_completed(futures)):
-            try:
-                result = future.result()
-                results.append(result)
-                log(f"[{i+1}/{len(tickers)}] {result['Ticker']} ✅")
-            except Exception as e:
-                log(f"Falha crítica: {e}")
+        for i, f in enumerate(as_completed(futures)):
+            r = f.result()
+            results.append(r)
+            log(f"[{i+1}/{len(tickers)}] {r['Ticker']}")
 
     return results
 
-# ================== WRITE ==================
-def write_sheet(df):
-    df = sanitize(df)
-
-    data = [df.columns.tolist()] + df.values.tolist()
-
-    # NÃO apaga tudo cegamente → mais seguro
-    sheet_dados.batch_clear(["A1:Z1000"])
-
-    sheet_dados.update(
-        range_name="A1",
-        values=data,
-        value_input_option="RAW"
-    )
-
 # ================== MAIN ==================
 def main():
-    start = time.time()
-
-    log("Carregando tickers...")
     tickers = load_tickers()
-
-    if not tickers:
-        log("Nenhum ticker encontrado")
-        return
-
-    log(f"{len(tickers)} ativos")
-
     results = fetch_all(tickers)
 
     df = pd.DataFrame(results)
 
-    log("Gravando na planilha...")
-    write_sheet(df)
+    # ENGINE
+    df["Valido"] = df.apply(filtro, axis=1)
+    df["Score Base"] = df.apply(lambda r: score_base(r) if r["Valido"] else 0, axis=1)
+
+    ajuste = df.apply(lambda r: ajuste_setor(r, r["Score Base"]), axis=1)
+    df["Score Ajustado"] = [x[0] for x in ajuste]
+    df["Setor"] = [x[1] for x in ajuste]
+
+    df["Score Final"] = df.apply(lambda r: momentum(r["Ticker"], r["Score Ajustado"]), axis=1)
+    df["Decisão"] = df["Score Final"].apply(decisao)
+
+    df = sanitize(df)
+    df = df.sort_values(by="Score Final", ascending=False)
+
+    data = [df.columns.tolist()] + df.values.tolist()
+
+    sheet_dados.batch_clear(["A1:Z1000"])
+    sheet_dados.update("A1", data)
 
     save_cache(cache)
 
-    elapsed = round(time.time() - start, 2)
-    log(f"Finalizado em {elapsed}s")
+    log("✅ FINALIZADO")
 
-# ================== RUN ==================
 if __name__ == "__main__":
     main()
