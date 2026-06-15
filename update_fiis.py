@@ -4,118 +4,7 @@ import numpy as np
 import time
 import random
 import json
-import threading
-import os
-import re
-import html as html_lib
-import requests
-import math
-
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from google.oauth2.service_account import Credentials
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-
-# ================== CONFIG ==================
-
-SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
-
-TICKERS_SHEET = "FIIs"
-DATA_SHEET = "FIIs Dados"
-
-MAX_WORKERS = 3
-MAX_RETRIES = 4
-RATE_LIMIT = 2.2
-
-CACHE_FILE = "cache_fiis.json"
-CACHE_TTL = 60 * 60 * 6
-CACHE_SCHEMA_VERSION = 2
-
-MIN_VALID_REQUIRED_FIELDS = [
-    "Preço Atual",
-    "Dividend Yield 12M (%)",
-    "P/VP"
-]
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-
-COLUMNS = [
-    "Ticker",
-    "Preço Atual",
-    "Dividend Yield 12M (%)",
-    "Rendimentos 12M",
-    "P/VP",
-    "Valor Patrimonial por Cota",
-    "Patrimônio Líquido",
-    "Valor de Mercado",
-    "Valor em Caixa (%)",
-    "Nº de Cotistas",
-    "Nº de Cotas",
-    "Rendimento Médio 24M",
-    "Liquidez Média Diária",
-    "Participação no IFIX (%)",
-    "Último Rendimento",
-    "Último Rendimento (%)",
-    "Última Data Base",
-    "Última Data Pagamento",
-    "Próximo Rendimento",
-    "Próximo Rendimento (%)",
-    "Próxima Data Base",
-    "Próxima Data Pagamento",
-    "Segmento",
-    "Tipo de Fundo",
-    "Fonte",
-    "Atualizado em",
-    "Status",
-    "Erro"
-]
-
-
-# ================== LOG ==================
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-
-def log_ticker(ticker, fonte, status, detalhe=""):
-    detalhe_txt = f" | {detalhe}" if detalhe else ""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} | {fonte} | {status}{detalhe_txt}")
-
-
-# ================== JSON / SHEETS SAFETY ==================
-
-def clean_for_json(value):
-    if value is None:
-        return None
-
-    if value is pd.NA:
-        return None
-
-    if isinstance(value, dict):
-        return {str(k): clean_for_json(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [clean_for_json(v) for v in value]
-
-    if isinstance(value, tuple):
-        return [clean_for_json(v) for v in value]
-
-    if isinstance(value, np.integer):
-        return int(value)
-
-    if isinstance(value, np.floating):
-        value = float(value)
-
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
+(value):import threading
             return None
         return value
 
@@ -207,7 +96,7 @@ def get_cached(ticker):
     schema_version = data.get("schema_version", 0)
 
     if schema_version < CACHE_SCHEMA_VERSION:
-        log_ticker(ticker, "CACHE", "IGNORADO", "schema antigo; evitando dados repetidos/antigos")
+        log_ticker(ticker, "CACHE", "IGNORADO", "schema antigo")
         return None
 
     timestamp = data.get("timestamp", 0)
@@ -230,7 +119,6 @@ def get_cached(ticker):
 
 def set_cache(ticker, payload):
     ticker = ticker.upper().strip()
-
     payload_to_save = clean_for_json(dict(payload))
 
     with cache_lock:
@@ -250,6 +138,7 @@ def sanitize_ticker(raw):
 
     s = str(raw).strip().upper()
 
+    # Correção defensiva para digitação tipo HGRE!!
     if re.match(r"^[A-Z]{4}!!$", s):
         s = s.replace("!!", "11")
 
@@ -293,6 +182,27 @@ def parse_br_number(value):
         return round(number, 6)
     except Exception:
         return None
+
+
+def plausible(value, min_value=None, max_value=None):
+    if value is None:
+        return None
+
+    try:
+        v = float(value)
+    except Exception:
+        return None
+
+    if math.isnan(v) or math.isinf(v):
+        return None
+
+    if min_value is not None and v < min_value:
+        return None
+
+    if max_value is not None and v > max_value:
+        return None
+
+    return round(v, 6)
 
 
 def sanitize_df(df):
@@ -360,51 +270,26 @@ def validate_page_for_ticker(ticker, text, fonte):
         ticker,
         fonte,
         "HTML SUSPEITO",
-        "ticker não encontrado no conteúdo da página; evitando dados repetidos"
+        "ticker não encontrado no conteúdo da página"
     )
 
     return False
 
 
-def extract_number_near_label(text, labels, max_gap=80):
-    """
-    Parser restrito.
-    Evita capturar números de blocos genéricos ou repetidos da página.
-    """
-    if isinstance(labels, str):
-        labels = [labels]
-
-    num = number_pattern()
-
-    for label in labels:
-        pattern_direto = rf"{re.escape(label)}\s*[:\-]?\s*(?:R\$)?\s*{num}"
-        match = re.search(pattern_direto, text, flags=re.I | re.S)
+def extract_first_match(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I | re.S)
 
         if match:
             value = parse_br_number(match.group(1))
+
             if value is not None:
                 return value
-
-        pattern_curto = rf"{re.escape(label)}\s+(.{{0,{max_gap}}})"
-        match = re.search(pattern_curto, text, flags=re.I | re.S)
-
-        if match:
-            trecho = match.group(1)
-            num_match = re.search(r"(?:R\$)?\s*(-?\d[\d\.\,]*)", trecho, flags=re.I)
-
-            if num_match:
-                value = parse_br_number(num_match.group(1))
-                if value is not None:
-                    return value
 
     return None
 
 
-def extract_percent_near_label(text, labels, max_gap=80):
-    return extract_number_near_label(text, labels, max_gap=max_gap)
-
-
-def extract_price_fii(text, ticker):
+def extract_price(text, ticker):
     ticker = ticker.upper().strip()
     num = number_pattern()
 
@@ -417,90 +302,77 @@ def extract_price_fii(text, ticker):
         rf"Valor atual\s+R\$\s*{num}",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I | re.S)
-
-        if match:
-            value = parse_br_number(match.group(1))
-
-            if value is not None and value > 0:
-                return value
-
-    return None
+    value = extract_first_match(text, patterns)
+    return plausible(value, 0.01, 10000)
 
 
-def extract_text_after_label(text, labels, max_gap=70):
-    if isinstance(labels, str):
-        labels = [labels]
-
-    for label in labels:
-        pattern = rf"{re.escape(label)}\s*[:\-]?\s*([A-Za-zÀ-ÿ0-9\s\/\-\&\.]{{3,{max_gap}}})"
-        match = re.search(pattern, text, flags=re.I)
-
-        if match:
-            value = match.group(1).strip()
-            value = re.split(
-                r"\s{2,}| Preço | Cotação | Dividend | P/VP | Patrimônio | Valor | Nº | Liquidez | Rendimento ",
-                value
-            )[0].strip()
-
-            if value and len(value) >= 3:
-                return value[:80]
-
-    return None
-
-
-def extract_statusinvest_rendimento_block(text, block_label):
+def extract_dy_12m(text):
     num = number_pattern()
-    date = r"(\d{2}/\d{2}/\d{2,4})"
-
-    pattern = (
-        rf"{re.escape(block_label)}\s*R\$\s*{num}"
-        rf".{{0,120}}?Rendimento\s*{num}\s*%"
-        rf".{{0,160}}?Data Base\s*{date}"
-        rf".{{0,120}}?Data Pagamento\s*{date}"
-    )
-
-    match = re.search(pattern, text, flags=re.I | re.S)
-
-    if not match:
-        return None, None, None, None
-
-    valor = parse_br_number(match.group(1))
-    percentual = parse_br_number(match.group(2))
-    data_base = match.group(3)
-    data_pagamento = match.group(4)
-
-    return valor, percentual, data_base, data_pagamento
-
-
-def extract_investidor10_rendimento_block(text, block_label):
-    num = number_pattern()
-    date = r"(\d{2}/\d{2}/\d{2,4})"
 
     patterns = [
-        (
-            rf"{re.escape(block_label)}.{{0,80}}?R\$\s*{num}"
-            rf".{{0,120}}?Data Base.{{0,40}}?{date}"
-            rf".{{0,120}}?Data Pagamento.{{0,40}}?{date}"
-        ),
-        (
-            rf"{re.escape(block_label)}.{{0,80}}?{num}"
-            rf".{{0,120}}?Data COM.{{0,40}}?{date}"
-            rf".{{0,120}}?Pagamento.{{0,40}}?{date}"
-        )
+        rf"Dividend Yield\s*(?:help_outline)?\s*{num}\s*%",
+        rf"Dividend Yield.*?{num}\s*%",
+        rf"DY\s*12M\s*{num}\s*%",
+        rf"DY\s*{num}\s*%",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I | re.S)
+    value = extract_first_match(text, patterns)
+    return plausible(value, 0, 100)
 
-        if match:
-            valor = parse_br_number(match.group(1))
-            data_base = match.group(2)
-            data_pagamento = match.group(3)
-            return valor, None, data_base, data_pagamento
 
-    return None, None, None, None
+def extract_rendimentos_12m(text):
+    num = number_pattern()
+
+    patterns = [
+        rf"Últimos 12 meses\s*R\$\s*{num}",
+        rf"Ultimos 12 meses\s*R\$\s*{num}",
+        rf"Rendimentos 12M\s*R\$\s*{num}",
+        rf"Rendimento 12M\s*R\$\s*{num}",
+        rf"12 meses\s*R\$\s*{num}",
+    ]
+
+    value = extract_first_match(text, patterns)
+    return plausible(value, 0, 1000)
+
+
+def extract_pvp(text):
+    num = number_pattern()
+
+    patterns = [
+        rf"P/VP\s*{num}",
+        rf"P\/VP\s*[:\-]?\s*{num}",
+    ]
+
+    value = extract_first_match(text, patterns)
+    return plausible(value, 0.01, 20)
+
+
+def extract_ultimo_rendimento(text, ticker):
+    ticker = ticker.upper().strip()
+    num = number_pattern()
+
+    patterns = [
+        rf"Último rendimento\s*R\$\s*{num}",
+        rf"Ultimo rendimento\s*R\$\s*{num}",
+        rf"O último rendimento do\s+{re.escape(ticker)}\s+foi de\s+R\$?\s*{num}",
+        rf"O ultimo rendimento do\s+{re.escape(ticker)}\s+foi de\s+R\$?\s*{num}",
+        rf"Rendimento\s+\d{{2}}/\d{{2}}/\d{{4}}\s+\d{{2}}/\d{{2}}/\d{{4}}\s+{num}",
+    ]
+
+    value = extract_first_match(text, patterns)
+    return plausible(value, 0, 100)
+
+
+def validate_core_data(data):
+    preco = data.get("Preço Atual")
+    dy = data.get("Dividend Yield 12M (%)")
+    pvp = data.get("P/VP")
+
+    return (
+        preco is not None and preco > 0 and
+        dy is not None and dy > 0 and
+        pvp is not None and pvp > 0
+    )
 
 
 def count_valid_fields(data):
@@ -510,19 +382,6 @@ def count_valid_fields(data):
         1 for k, v in data.items()
         if k not in ignored and v not in [None, ""]
     )
-
-
-def has_minimum_required_fields(data):
-    for field in MIN_VALID_REQUIRED_FIELDS:
-        value = data.get(field)
-
-        if value is None or value == "":
-            return False
-
-        if isinstance(value, (int, float)) and value <= 0:
-            return False
-
-    return True
 
 
 def normalize_result(data):
@@ -566,130 +425,17 @@ def load_tickers():
     return tickers
 
 
-# ================== INVESTIDOR10 PRINCIPAL ==================
+# ================== PARSE FONTE ==================
 
-def parse_investidor10(ticker, text):
-    ultimo_valor, ultimo_pct, ultima_base, ultima_pagamento = extract_investidor10_rendimento_block(
-        text,
-        "Último rendimento"
-    )
-
-    prox_valor, prox_pct, prox_base, prox_pagamento = extract_investidor10_rendimento_block(
-        text,
-        "Próximo rendimento"
-    )
-
+def parse_source(ticker, text, fonte):
     data = {
         "Ticker": ticker,
-
-        "Preço Atual": extract_price_fii(text, ticker),
-
-        "Dividend Yield 12M (%)": extract_percent_near_label(
-            text,
-            ["Dividend Yield", "DY", "Dividend Yield 12M"],
-            max_gap=80
-        ),
-
-        "Rendimentos 12M": extract_number_near_label(
-            text,
-            ["Rendimentos 12M", "Rendimento 12M", "Últimos 12 meses"],
-            max_gap=90
-        ),
-
-        "P/VP": extract_number_near_label(
-            text,
-            ["P/VP", "P/VP Atual"],
-            max_gap=60
-        ),
-
-        "Valor Patrimonial por Cota": extract_number_near_label(
-            text,
-            [
-                "Valor Patrimonial por Cota",
-                "Valor patrimonial por cota",
-                "Val. patrimonial p/cota",
-                "VPC",
-                "VP/Cota"
-            ],
-            max_gap=90
-        ),
-
-        "Patrimônio Líquido": extract_number_near_label(
-            text,
-            ["Patrimônio Líquido", "Patrimônio líquido", "Patrimônio"],
-            max_gap=90
-        ),
-
-        "Valor de Mercado": extract_number_near_label(
-            text,
-            ["Valor de Mercado", "Valor de mercado"],
-            max_gap=90
-        ),
-
-        "Valor em Caixa (%)": extract_percent_near_label(
-            text,
-            ["Valor em Caixa", "Valor em caixa"],
-            max_gap=80
-        ),
-
-        "Nº de Cotistas": extract_number_near_label(
-            text,
-            ["Nº de Cotistas", "Número de Cotistas", "Cotistas"],
-            max_gap=80
-        ),
-
-        "Nº de Cotas": extract_number_near_label(
-            text,
-            ["Nº de Cotas", "Número de Cotas", "Cotas Emitidas"],
-            max_gap=80
-        ),
-
-        "Rendimento Médio 24M": extract_number_near_label(
-            text,
-            [
-                "Rendimento Médio 24M",
-                "Rendim. Médio 24M",
-                "RENDIM. MÉDIO (24M)",
-                "Rendimento médio"
-            ],
-            max_gap=90
-        ),
-
-        "Liquidez Média Diária": extract_number_near_label(
-            text,
-            ["Liquidez Média Diária", "Liquidez média diária", "Liquidez Diária", "Liquidez"],
-            max_gap=90
-        ),
-
-        "Participação no IFIX (%)": extract_percent_near_label(
-            text,
-            ["Participação no IFIX", "PARTICIPAÇÃO NO IFIX"],
-            max_gap=80
-        ),
-
-        "Último Rendimento": ultimo_valor,
-        "Último Rendimento (%)": ultimo_pct,
-        "Última Data Base": ultima_base,
-        "Última Data Pagamento": ultima_pagamento,
-
-        "Próximo Rendimento": prox_valor,
-        "Próximo Rendimento (%)": prox_pct,
-        "Próxima Data Base": prox_base,
-        "Próxima Data Pagamento": prox_pagamento,
-
-        "Segmento": extract_text_after_label(
-            text,
-            ["Segmento", "Setor"],
-            max_gap=70
-        ),
-
-        "Tipo de Fundo": extract_text_after_label(
-            text,
-            ["Tipo de Fundo", "Tipo do Fundo", "Tipo"],
-            max_gap=70
-        ),
-
-        "Fonte": "Investidor10",
+        "Preço Atual": extract_price(text, ticker),
+        "Dividend Yield 12M (%)": extract_dy_12m(text),
+        "Rendimentos 12M": extract_rendimentos_12m(text),
+        "P/VP": extract_pvp(text),
+        "Último Rendimento": extract_ultimo_rendimento(text, ticker),
+        "Fonte": fonte,
         "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
         "Status": "OK",
         "Erro": None
@@ -697,17 +443,20 @@ def parse_investidor10(ticker, text):
 
     data = clean_for_json(data)
 
-    if has_minimum_required_fields(data):
+    if validate_core_data(data):
         data["Status"] = "OK"
+        data["Erro"] = None
     elif count_valid_fields(data) > 0:
         data["Status"] = "PARCIAL"
-        data["Erro"] = "Investidor10 retornou dados parciais; campos mínimos incompletos"
+        data["Erro"] = f"{fonte} retornou dados parciais; campos essenciais incompletos"
     else:
         data["Status"] = "ERRO"
-        data["Erro"] = "Investidor10 não retornou indicadores úteis"
+        data["Erro"] = f"{fonte} não retornou indicadores úteis"
 
     return data
 
+
+# ================== FETCH INVESTIDOR10 ==================
 
 def fetch_investidor10(ticker):
     url = f"https://investidor10.com.br/fiis/{ticker.lower()}/"
@@ -752,21 +501,15 @@ def fetch_investidor10(ticker):
             if not validate_page_for_ticker(ticker, text, "INVESTIDOR10"):
                 raise Exception("HTML do Investidor10 não corresponde ao ticker solicitado")
 
-            data = parse_investidor10(ticker, text)
-
+            data = parse_source(ticker, text, "Investidor10")
             valid_count = count_valid_fields(data)
-            found_fields = [
-                k for k, v in data.items()
-                if k not in ["Ticker", "Fonte", "Atualizado em", "Status", "Erro"]
-                and v not in [None, ""]
-            ]
 
             if data["Status"] == "OK":
                 log_ticker(
                     ticker,
                     "INVESTIDOR10",
                     "OK",
-                    f"{valid_count} campos capturados: {', '.join(found_fields)}"
+                    f"preço={data.get('Preço Atual')} | DY={data.get('Dividend Yield 12M (%)')} | P/VP={data.get('P/VP')}"
                 )
                 return data, valid_count, None
 
@@ -775,7 +518,7 @@ def fetch_investidor10(ticker):
                     ticker,
                     "INVESTIDOR10",
                     "PARCIAL",
-                    f"{valid_count} campos capturados; fallback será avaliado"
+                    f"{valid_count} campos capturados; fallback será acionado"
                 )
                 return data, valid_count, data.get("Erro")
 
@@ -815,145 +558,7 @@ def fetch_investidor10(ticker):
     return None, 0, last_error
 
 
-# ================== STATUS INVEST FALLBACK ==================
-
-def parse_statusinvest(ticker, text):
-    ultimo_valor, ultimo_pct, ultima_base, ultima_pagamento = extract_statusinvest_rendimento_block(
-        text,
-        "Último rendimento"
-    )
-
-    prox_valor, prox_pct, prox_base, prox_pagamento = extract_statusinvest_rendimento_block(
-        text,
-        "Próximo Rendimento"
-    )
-
-    data = {
-        "Ticker": ticker,
-
-        "Preço Atual": extract_price_fii(text, ticker),
-
-        "Dividend Yield 12M (%)": extract_percent_near_label(
-            text,
-            ["Dividend Yield"],
-            max_gap=80
-        ),
-
-        "Rendimentos 12M": extract_number_near_label(
-            text,
-            ["Últimos 12 meses"],
-            max_gap=70
-        ),
-
-        "P/VP": extract_number_near_label(
-            text,
-            ["P/VP"],
-            max_gap=60
-        ),
-
-        "Valor Patrimonial por Cota": extract_number_near_label(
-            text,
-            [
-                "Val. patrimonial p/cota",
-                "Valor patrimonial p/cota",
-                "Valor patrimonial por cota"
-            ],
-            max_gap=80
-        ),
-
-        "Patrimônio Líquido": extract_number_near_label(
-            text,
-            ["Patrimônio"],
-            max_gap=80
-        ),
-
-        "Valor de Mercado": extract_number_near_label(
-            text,
-            ["Valor de mercado"],
-            max_gap=80
-        ),
-
-        "Valor em Caixa (%)": extract_percent_near_label(
-            text,
-            ["Valor em caixa"],
-            max_gap=70
-        ),
-
-        "Nº de Cotistas": extract_number_near_label(
-            text,
-            ["Nº de Cotistas", "Número de Cotistas"],
-            max_gap=80
-        ),
-
-        "Nº de Cotas": extract_number_near_label(
-            text,
-            ["Nº de Cotas", "Número de Cotas"],
-            max_gap=80
-        ),
-
-        "Rendimento Médio 24M": extract_number_near_label(
-            text,
-            [
-                "RENDIM. MÉDIO (24M)",
-                "Rendim. Médio (24M)",
-                "Rendimento Médio 24M"
-            ],
-            max_gap=80
-        ),
-
-        "Liquidez Média Diária": extract_number_near_label(
-            text,
-            ["Liquidez média diária", "Liquidez Média Diária"],
-            max_gap=90
-        ),
-
-        "Participação no IFIX (%)": extract_percent_near_label(
-            text,
-            ["PARTICIPAÇÃO NO IFIX", "Participação no IFIX"],
-            max_gap=80
-        ),
-
-        "Último Rendimento": ultimo_valor,
-        "Último Rendimento (%)": ultimo_pct,
-        "Última Data Base": ultima_base,
-        "Última Data Pagamento": ultima_pagamento,
-
-        "Próximo Rendimento": prox_valor,
-        "Próximo Rendimento (%)": prox_pct,
-        "Próxima Data Base": prox_base,
-        "Próxima Data Pagamento": prox_pagamento,
-
-        "Segmento": extract_text_after_label(
-            text,
-            ["Segmento"],
-            max_gap=70
-        ),
-
-        "Tipo de Fundo": extract_text_after_label(
-            text,
-            ["Tipo de Fundo", "Tipo"],
-            max_gap=70
-        ),
-
-        "Fonte": "StatusInvest",
-        "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Status": "OK",
-        "Erro": None
-    }
-
-    data = clean_for_json(data)
-
-    if has_minimum_required_fields(data):
-        data["Status"] = "OK"
-    elif count_valid_fields(data) > 0:
-        data["Status"] = "PARCIAL"
-        data["Erro"] = "Status Invest retornou dados parciais; campos mínimos incompletos"
-    else:
-        data["Status"] = "ERRO"
-        data["Erro"] = "Status Invest não retornou indicadores úteis"
-
-    return data
-
+# ================== FETCH STATUS INVEST ==================
 
 def fetch_statusinvest(ticker):
     url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
@@ -998,21 +603,15 @@ def fetch_statusinvest(ticker):
             if not validate_page_for_ticker(ticker, text, "STATUSINVEST"):
                 raise Exception("HTML do Status Invest não corresponde ao ticker solicitado")
 
-            data = parse_statusinvest(ticker, text)
-
+            data = parse_source(ticker, text, "StatusInvest")
             valid_count = count_valid_fields(data)
-            found_fields = [
-                k for k, v in data.items()
-                if k not in ["Ticker", "Fonte", "Atualizado em", "Status", "Erro"]
-                and v not in [None, ""]
-            ]
 
             if data["Status"] == "OK":
                 log_ticker(
                     ticker,
                     "STATUSINVEST",
                     "OK",
-                    f"{valid_count} campos capturados: {', '.join(found_fields)}"
+                    f"preço={data.get('Preço Atual')} | DY={data.get('Dividend Yield 12M (%)')} | P/VP={data.get('P/VP')}"
                 )
                 return data, valid_count, None
 
@@ -1073,7 +672,7 @@ def fetch_ticker(ticker):
             ticker,
             "CACHE",
             "OK",
-            f"fonte original: {cached.get('Fonte')} | preço: {cached.get('Preço Atual')}"
+            f"fonte original: {cached.get('Fonte')} | preço={cached.get('Preço Atual')} | DY={cached.get('Dividend Yield 12M (%)')} | P/VP={cached.get('P/VP')}"
         )
         return normalize_result(cached)
 
@@ -1133,7 +732,7 @@ def fetch_ticker(ticker):
         set_cache(ticker, best_partial)
         return normalize_result(best_partial)
 
-    # 4) Se nada deu certo, retorna ERRO fail-safe
+    # 4) Se nada deu certo, retorna ERRO
     error_msg = " | ".join(errors) if errors else "nenhuma fonte retornou dados reais"
 
     log_ticker(
@@ -1186,7 +785,7 @@ def fetch_all(tickers):
                 log(
                     f"PROGRESSO [{completed}/{total}] "
                     f"{ticker} | posição original: {index + 1} | "
-                    f"{status} | {fonte} | preço: {preco} | DY: {dy} | P/VP: {pvp}"
+                    f"{status} | {fonte} | preço={preco} | DY={dy} | P/VP={pvp}"
                 )
 
             except Exception as e:
@@ -1234,8 +833,8 @@ def write_sheet(df):
 
     log("PLANILHA | JSON validado com sucesso")
 
-    log("PLANILHA | limpando intervalo bruto A1:AB1000")
-    sheet_dados.batch_clear(["A1:AB1000"])
+    log(f"PLANILHA | limpando intervalo {CLEAR_RANGE}")
+    sheet_dados.batch_clear([CLEAR_RANGE])
 
     log(f"PLANILHA | gravando {len(df)} linhas e {len(COLUMNS)} colunas")
     sheet_dados.update(
@@ -1260,13 +859,14 @@ def main():
 
     log(f"FIIs | {len(tickers)} ativos encontrados")
     log("ORDEM | a ordem da aba FIIs será preservada na aba FIIs Dados")
-    log("ORDEM DE FONTES | 1º Investidor10 | 2º Status Invest | 3º ERRO/PARCIAL fail-safe")
-    log("CACHE | arquivo: cache_fiis.json")
+    log("ORDEM DE FONTES | 1º Investidor10 | 2º Status Invest | 3º ERRO/PARCIAL")
+    log("COLUNAS | versão simplificada: Ticker, Preço, DY, Rendimentos 12M, P/VP, Último Rendimento")
+    log(f"CACHE | arquivo: {CACHE_FILE}")
     log(f"CACHE | TTL configurado: {round(CACHE_TTL / 3600, 1)} horas")
     log(f"CACHE | schema version exigido: {CACHE_SCHEMA_VERSION}")
     log(f"RATE LIMIT | intervalo global mínimo: {RATE_LIMIT}s")
     log(f"THREADS | max_workers: {MAX_WORKERS}")
-    log("FAIL-SAFE | mínimo exigido: Preço Atual + Dividend Yield 12M (%) + P/VP")
+    log("FAIL-SAFE | OK exige: Preço Atual + Dividend Yield 12M (%) + P/VP")
     log("VALIDAÇÃO HTML | ativa: ticker precisa aparecer no conteúdo da página")
 
     results = fetch_all(tickers)
@@ -1276,6 +876,7 @@ def main():
     df = df.reindex(columns=COLUMNS)
     df = sanitize_df(df)
 
+    # Reforço de ordem
     try:
         ordem_tickers = {ticker: index for index, ticker in enumerate(tickers)}
 
@@ -1330,3 +931,94 @@ def main():
 
 if __name__ == "__main__":
     main()
+import os
+import re
+import html as html_lib
+import requests
+import math
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.oauth2.service_account import Credentials
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+
+# ================== CONFIG ==================
+
+SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
+
+TICKERS_SHEET = "FIIs"
+DATA_SHEET = "FIIs Dados"
+
+MAX_WORKERS = 3
+MAX_RETRIES = 4
+RATE_LIMIT = 2.2
+
+CACHE_FILE = "cache_fiis.json"
+CACHE_TTL = 60 * 60 * 6
+CACHE_SCHEMA_VERSION = 3  # versão simplificada e mais rígida
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+COLUMNS = [
+    "Ticker",
+    "Preço Atual",
+    "Dividend Yield 12M (%)",
+    "Rendimentos 12M",
+    "P/VP",
+    "Último Rendimento",
+    "Fonte",
+    "Atualizado em",
+    "Status",
+    "Erro"
+]
+
+# Importante:
+# Como a versão anterior gravava até AB, esta limpeza remove colunas antigas contaminadas.
+# Quando reconstruirmos o Apps Script novo, podemos trocar para A1:J1000 se quiser preservar scores.
+CLEAR_RANGE = "A1:AB1000"
+
+
+# ================== LOG ==================
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def log_ticker(ticker, fonte, status, detalhe=""):
+    detalhe_txt = f" | {detalhe}" if detalhe else ""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} | {fonte} | {status}{detalhe_txt}")
+
+
+# ================== JSON / SHEETS SAFETY ==================
+
+def clean_for_json(value):
+    if value is None:
+        return None
+
+    if value is pd.NA:
+        return None
+
+    if isinstance(value, dict):
+        return {str(k): clean_for_json(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, tuple):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, np.integer):
+        return int(value)
+
+    if isinstance(value, np.floating):
+        value = float(value)
+
+    if isinstance(value, float):
