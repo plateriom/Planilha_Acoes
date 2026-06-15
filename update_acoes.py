@@ -21,7 +21,7 @@ MAX_RETRIES = 4
 RATE_LIMIT = 2.2
 
 CACHE_FILE = "cache.json"
-CACHE_TTL = 21600  # 6h
+CACHE_TTL = 21600
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -30,9 +30,10 @@ SCOPES = [
 
 # ================== SETORES ==================
 SETOR_MAP = {
-    "BBAS3": "Bancos", "ITUB4": "Bancos",
+    "BBAS3": "Bancos", "ITUB4": "Bancos", "SANB11": "Bancos",
     "VALE3": "Commodities", "PETR4": "Commodities",
-    "WEGE3": "Industrial", "ABEV3": "Consumo",
+    "WEGE3": "Industrial",
+    "ABEV3": "Consumo"
 }
 
 PESO_SETOR = {
@@ -130,6 +131,7 @@ def fetch_ticker(ticker):
                 "P/VP": safe_round(info.get('priceToBook')),
                 "Div Yield 12M (%)": safe_percent(div),
                 "Status": "OK",
+                "Erro": None,
                 "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
             }
 
@@ -140,19 +142,31 @@ def fetch_ticker(ticker):
             if attempt < MAX_RETRIES - 1:
                 time.sleep((3 ** attempt) + random.uniform(1, 2))
             else:
-                return {"Ticker": ticker, "Status": "ERRO", "Erro": str(e)}
+                return {
+                    "Ticker": ticker,
+                    "Margem Líquida (%)": None,
+                    "ROE (%)": None,
+                    "P/VP": None,
+                    "Div Yield 12M (%)": None,
+                    "Status": "ERRO",
+                    "Erro": str(e),
+                    "Atualizado em": None
+                }
 
 # ================== ENGINE ==================
 def filtro(row):
     return not (
-        row["ROE (%)"] is None or row["ROE (%)"] < 5 or
-        row["Margem Líquida (%)"] is None or row["Margem Líquida (%)"] < 0 or
-        row["P/VP"] is None
+        row.get("ROE (%)") is None or row.get("ROE (%)") < 5 or
+        row.get("Margem Líquida (%)") is None or row.get("Margem Líquida (%)") < 0 or
+        row.get("P/VP") is None
     )
 
 def score_base(row):
     score = 0
-    roe, margem, pvp, dy = row["ROE (%)"], row["Margem Líquida (%)"], row["P/VP"], row["Div Yield 12M (%)"]
+    roe = row.get("ROE (%)")
+    margem = row.get("Margem Líquida (%)")
+    pvp = row.get("P/VP")
+    dy = row.get("Div Yield 12M (%)")
 
     if roe:
         score += 20 if roe > 20 else 15 if roe > 15 else 10 if roe > 10 else 5
@@ -169,11 +183,12 @@ def score_base(row):
     return max(0, min(100, score))
 
 def ajuste_setor(row, score):
-    t = row["Ticker"]
-    setor = SETOR_MAP.get(t, "Outro")
+    ticker = row.get("Ticker")
+    setor = SETOR_MAP.get(ticker, "Outro")
     regras = PESO_SETOR.get(setor, {})
 
-    roe, pvp = row["ROE (%)"], row["P/VP"]
+    roe = row.get("ROE (%)")
+    pvp = row.get("P/VP")
 
     if roe and roe >= regras.get("roe_min", 0):
         score += 5
@@ -213,8 +228,9 @@ def decisao(score):
     if score >= 30: return "REDUZIR"
     return "VENDER"
 
-# ================== EXEC ==================
-def fetch_all(tickers):
+# ================== MAIN ==================
+def main():
+    tickers = load_tickers()
     results = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -225,16 +241,19 @@ def fetch_all(tickers):
             results.append(r)
             log(f"[{i+1}/{len(tickers)}] {r['Ticker']}")
 
-    return results
-
-# ================== MAIN ==================
-def main():
-    tickers = load_tickers()
-    results = fetch_all(tickers)
-
     df = pd.DataFrame(results)
 
-    # ENGINE
+    # ================== FIX SCHEMA ==================
+    colunas = [
+        "Ticker","Margem Líquida (%)","ROE (%)","P/VP",
+        "Div Yield 12M (%)","Status","Erro","Atualizado em"
+    ]
+
+    for c in colunas:
+        if c not in df.columns:
+            df[c] = None
+
+    # ================== ENGINE ==================
     df["Valido"] = df.apply(filtro, axis=1)
     df["Score Base"] = df.apply(lambda r: score_base(r) if r["Valido"] else 0, axis=1)
 
@@ -248,14 +267,13 @@ def main():
     df = sanitize(df)
     df = df.sort_values(by="Score Final", ascending=False)
 
+    # ================== WRITE ==================
     data = [df.columns.tolist()] + df.values.tolist()
-
     sheet_dados.batch_clear(["A1:Z1000"])
     sheet_dados.update("A1", data)
 
     save_cache(cache)
-
-    log("✅ FINALIZADO")
+    log("✅ FINALIZADO SEM ERROS")
 
 if __name__ == "__main__":
     main()
