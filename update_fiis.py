@@ -224,6 +224,67 @@ def html_to_text(raw_html):
     text = html_lib.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
+def normalize_text_for_match(value):
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .normalize("NFD")
+        if False else str(value or "").strip().lower()
+    )
+
+
+def extract_investidor10_card_value(raw_html, wanted_labels):
+    """
+    Extrai valores dos cards principais do Investidor10 usando a estrutura:
+    div._card-header + div._card-body
+
+    Exemplo esperado:
+    header: DY (12M)
+    body: 10,07%
+    """
+    if not BeautifulSoup:
+        return None
+
+    if isinstance(wanted_labels, str):
+        wanted_labels = [wanted_labels]
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    wanted_labels_norm = [
+        str(label).strip().lower()
+        for label in wanted_labels
+    ]
+
+    headers = soup.select("._card-header")
+
+    for header in headers:
+        header_text = header.get_text(" ", strip=True)
+        header_norm = header_text.lower()
+
+        matched = any(label in header_norm for label in wanted_labels_norm)
+
+        if not matched:
+            continue
+
+        parent = header.parent
+
+        if not parent:
+            continue
+
+        body = parent.select_one("._card-body")
+
+        if not body:
+            continue
+
+        body_text = body.get_text(" ", strip=True)
+
+        value = parse_br_number(body_text)
+
+        if value is not None:
+            return value
+
+    return None
 
 def build_headers():
     return {
@@ -271,13 +332,73 @@ def extract_price(text, ticker):
     return first_number(text, patterns, 0.01, 10000)
 
 
-def extract_dy_12m(text):
+def extract_dy_12m(text, ticker=None, raw_html=None, fonte=None):
+    """
+    Extrai Dividend Yield 12M com prioridade para o bloco principal do Investidor10.
+
+    Ordem:
+    1. Card HTML do Investidor10: _card-header = DY (12M), _card-body = valor
+    2. Texto direto: TICKER DY (12M) 10,07%
+    3. Texto direto: DY (12M) 10,07%
+    4. Fallback restrito: Dividend Yield 10,07%
+    """
+
+    fonte_norm = str(fonte or "").strip().lower()
+
+    # 1) Melhor caso: card do Investidor10
+    if raw_html and "investidor10" in fonte_norm:
+        value = extract_investidor10_card_value(
+            raw_html,
+            [
+                "dy (12m)",
+                "dy 12m",
+                "dividend yield"
+            ]
+        )
+
+        value = plausible(value, 0.01, 100)
+
+        if value is not None:
+            return value
+
+    num = number_pattern()
+
+    patterns = []
+
+    # 2) Padrão textual específico do topo:
+    # HGRE11 DY (12M) 10,07%
+    if ticker:
+        ticker_esc = re.escape(str(ticker).upper().strip())
+
+        patterns.extend([
+            rf"{ticker_esc}\s+DY\s*\(12M\)\s*{num}\s*%",
+            rf"{ticker_esc}\s+DY\s*12M\s*{num}\s*%",
+            rf"{ticker_esc}.{{0,80}}?DY\s*\(12M\)\s*{num}\s*%",
+        ])
+
+    # 3) Padrão sem ticker
+    patterns.extend([
+        rf"DY\s*\(12M\)\s*{num}\s*%",
+        rf"DY\s*12M\s*{num}\s*%",
+    ])
+
+    value = extract_first_match(text, patterns)
+    value = plausible(value, 0.01, 100)
+
+    if value is not None:
+        return value
+
+    # 4) Fallback mais restrito para Dividend Yield.
+    # Importante: não usar "Dividend Yield.*?numero" muito aberto.
     patterns = [
-        rf"Dividend Yield\s*(?:help_outline)?\s*{NUM}\s*%",
-        rf"Dividend Yield.{{0,80}}?{NUM}\s*%",
-        rf"DY\s*12M\s*{NUM}\s*%",
+        rf"Dividend Yield\s*{num}\s*%",
+        rf"Dividend Yield\s+{num}\s*%",
     ]
-    return first_number(text, patterns, 0.01, 100)
+
+    value = extract_first_match(text, patterns)
+    value = plausible(value, 0.01, 100)
+
+    return value
 
 
 def extract_rendimentos_12m(text):
@@ -344,11 +465,11 @@ def load_tickers():
     return list(dict.fromkeys(tickers))
 
 
-def parse_source(ticker, text, fonte):
+def parse_source(ticker, text, fonte, raw_html=None):
     data = {
         "Ticker": ticker,
         "Preço Atual": extract_price(text, ticker),
-        "Dividend Yield 12M (%)": extract_dy_12m(text),
+        "Dividend Yield 12M (%)": extract_dy_12m(text,ticker=ticker,raw_html=raw_html,fonte=fonte),
         "Rendimentos 12M": extract_rendimentos_12m(text),
         "P/VP": extract_pvp(text),
         "Último Rendimento": extract_ultimo_rendimento(text, ticker),
@@ -385,13 +506,14 @@ def fetch_source(ticker, fonte, url):
             if response.status_code == 410:
                 raise Exception(f"FII indisponível/removido no {fonte} HTTP 410")
             response.raise_for_status()
-            text = html_to_text(response.text)
+            raw_html = response.text
+            text = html_to_text(raw_html)
             if not page_has_ticker(ticker, text):
                 raise Exception(f"HTML do {fonte} não corresponde ao ticker solicitado")
-            data = parse_source(ticker, text, fonte)
+            data = parse_source(ticker,text,fonte,raw_html=raw_html)
             valid_count = count_valid_fields(data)
             if data["Status"] == "OK":
-                log_ticker(ticker, fonte.upper(), "OK", f"preço={data.get('Preço Atual')} | DY={data.get('Dividend Yield 12M (%)')} | P/VP={data.get('P/VP')}")
+                log_ticker(ticker,fonte.upper(),"OK",f"preço={data.get('Preço Atual')} | "f"DY={data.get('Dividend Yield 12M (%)')} | "f"P/VP={data.get('P/VP')} | "f"último rendimento={data.get('Último Rendimento')}")
                 return data, valid_count, None
             if data["Status"] == "PARCIAL":
                 log_ticker(ticker, fonte.upper(), "PARCIAL", f"{valid_count} campos capturados")
