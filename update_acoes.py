@@ -741,36 +741,79 @@ def fetch_ticker(ticker):
         "Erro": error_msg
     })
 
-
 # ================== PARALLEL ==================
 
 def fetch_all(tickers):
-    results = []
+    # Mantém a ordem original da aba AÇÕES
+    results = [None] * len(tickers)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(fetch_ticker, t) for t in tickers]
+        future_to_index = {
+            executor.submit(fetch_ticker, ticker): index
+            for index, ticker in enumerate(tickers)
+        }
 
-        for i, future in enumerate(as_completed(futures)):
+        total = len(tickers)
+        completed = 0
+
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            ticker_original = tickers[index]
+
             try:
                 result = future.result()
                 result = clean_for_json(result)
-                results.append(result)
 
-                ticker = result.get("Ticker", "DESCONHECIDO")
+                # Garante que o resultado volte para a posição original
+                results[index] = result
+
+                completed += 1
+
+                ticker = result.get("Ticker", ticker_original)
                 status = result.get("Status", "SEM_STATUS")
                 fonte = result.get("Fonte", "SEM_FONTE")
                 preco = result.get("Preço Atual", None)
 
                 log(
-                    f"PROGRESSO [{i + 1}/{len(tickers)}] "
-                    f"{ticker} | {status} | {fonte} | preço: {preco}"
+                    f"PROGRESSO [{completed}/{total}] "
+                    f"{ticker} | posição original: {index + 1} | "
+                    f"{status} | {fonte} | preço: {preco}"
                 )
 
             except Exception as e:
-                log(f"FALHA CRÍTICA NO FUTURE | {e}")
+                completed += 1
+
+                log_ticker(
+                    ticker_original,
+                    "FINAL",
+                    "ERRO",
+                    f"falha crítica no future: {e}"
+                )
+
+                # Mesmo em erro, preserva a posição original
+                results[index] = normalize_result({
+                    "Ticker": ticker_original,
+                    "Preço Atual": None,
+                    "Fonte": None,
+                    "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Status": "ERRO",
+                    "Erro": f"falha crítica no future: {e}"
+                })
+
+    # Remove qualquer None residual, mas sem alterar a ordem dos existentes
+    results = [
+        result if result is not None else normalize_result({
+            "Ticker": tickers[i],
+            "Preço Atual": None,
+            "Fonte": None,
+            "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "Status": "ERRO",
+            "Erro": "resultado ausente após execução paralela"
+        })
+        for i, result in enumerate(results)
+    ]
 
     return results
-
 
 # ================== WRITE ==================
 
