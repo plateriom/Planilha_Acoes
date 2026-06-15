@@ -402,14 +402,24 @@ def extract_dy_12m(text, ticker=None, raw_html=None, fonte=None):
 
 
 def extract_rendimentos_12m(text):
+    """
+    Extrai Rendimentos 12M principalmente do padrão do Status Invest:
+
+    Últimos 12 meses R$ 12,5500
+
+    No Investidor10, esse campo nem sempre aparece de forma limpa,
+    então esta função é propositalmente conservadora.
+    """
     patterns = [
         rf"Últimos 12 meses\s*R\$\s*{NUM}",
         rf"Ultimos 12 meses\s*R\$\s*{NUM}",
-        rf"Rendimentos 12M\s*R\$\s*{NUM}",
-        rf"Rendimento 12M\s*R\$\s*{NUM}",
+        rf"Últimos\s+12\s+meses\s*R\$\s*{NUM}",
+        rf"Ultimos\s+12\s+meses\s*R\$\s*{NUM}",
+        rf"Rendimentos\s*12M\s*R\$\s*{NUM}",
+        rf"Rendimento\s*12M\s*R\$\s*{NUM}",
     ]
-    return first_number(text, patterns, 0, 1000)
 
+    return first_number(text, patterns, 0, 1000)
 
 def extract_pvp(text):
     patterns = [
@@ -539,7 +549,192 @@ def fetch_investidor10(ticker):
 
 def fetch_statusinvest(ticker):
     return fetch_source(ticker, "StatusInvest", f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}")
+def fetch_statusinvest_rendimentos_12m(ticker):
+    """
+    Busca}"    Busca exclusivamente o campo Rendimentos 12M no Status Invest.
+                )
+                return rendimentos_12m, None
 
+            raise Exception("Rendimentos 12M não encontrado no Status Invest")
+
+        except Exception as e:
+            last_error = str(e)
+
+            if "HTTP 410" in last_error or "não encontrado" in last_error:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "FALHOU SEM RETRY",
+                    last_error
+                )
+                break
+
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = (3 ** attempt) + random.uniform(1, 2)
+
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "RETRY",
+                    f"{last_error} | aguardando {round(sleep_time, 1)}s"
+                )
+
+                time.sleep(sleep_time)
+            else:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "FALHOU",
+                    last_error
+                )
+
+    return None, last_error
+
+    Esta função não substitui preço, DY, P/VP nem último rendimento.
+    Ela serve apenas para complementar o dado ausente.
+    """
+    url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            rate_limiter()
+
+            log_ticker(
+                ticker,
+                "STATUSINVEST_SUPLEMENTO",
+                f"TENTATIVA {attempt + 1}/{MAX_RETRIES}",
+                "buscando apenas Rendimentos 12M"
+            )
+
+            response = requests.get(
+                url,
+                headers=build_headers(),
+                timeout=25
+            )
+
+            log_ticker(
+                ticker,
+                "STATUSINVEST_SUPLEMENTO",
+                f"HTTP {response.status_code}"
+            )
+
+            if response.status_code in [403, 429]:
+                raise Exception(f"bloqueio/rate limit HTTP {response.status_code}")
+
+            if response.status_code == 404:
+                raise Exception("FII não encontrado no Status Invest")
+
+            if response.status_code == 410:
+                raise Exception("FII indisponível/removido no Status Invest HTTP 410")
+
+            response.raise_for_status()
+
+            text = html_to_text(response.text)
+
+            if not page_has_ticker(ticker, text):
+                raise Exception("HTML do Status Invest não corresponde ao ticker solicitado")
+
+            rendimentos_12m = extract_rendimentos_12m(text)
+
+            if rendimentos_12m is not None and rendimentos_12m > 0:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "OK",
+def fetch_statusinvest_rendimentos_12m(ticker):
+    """
+    Busca}"    Busca exclusivamente o campo Rendimentos 12M no Status Invest.
+                )
+                return rendimentos_12m, None
+
+            raise Exception("Rendimentos 12M não encontrado no Status Invest")
+
+        except Exception as e:
+            last_error = str(e)
+
+            if "HTTP 410" in last_error or "não encontrado" in last_error:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "FALHOU SEM RETRY",
+                    last_error
+                )
+                break
+
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = (3 ** attempt) + random.uniform(1, 2)
+
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "RETRY",
+                    f"{last_error} | aguardando {round(sleep_time, 1)}s"
+                )
+
+                time.sleep(sleep_time)
+            else:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "FALHOU",
+                    last_error
+                )
+
+    return None, last_error
+
+    Esta função não substitui preço, DY, P/VP nem último rendimento.
+    Ela serve apenas para complementar o dado ausente.
+    """
+    url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            rate_limiter()
+
+            log_ticker(
+                ticker,
+                "STATUSINVEST_SUPLEMENTO",
+                f"TENTATIVA {attempt + 1}/{MAX_RETRIES}",
+                "buscando apenas Rendimentos 12M"
+            )
+
+            response = requests.get(
+                url,
+                headers=build_headers(),
+                timeout=25
+            )
+
+            log_ticker(
+                ticker,
+                "STATUSINVEST_SUPLEMENTO",
+                f"HTTP {response.status_code}"
+            )
+
+            if response.status_code in [403, 429]:
+                raise Exception(f"bloqueio/rate limit HTTP {response.status_code}")
+
+            if response.status_code == 404:
+                raise Exception("FII não encontrado no Status Invest")
+
+            if response.status_code == 410:
+                raise Exception("FII indisponível/removido no Status Invest HTTP 410")
+
+            response.raise_for_status()
+
+            text = html_to_text(response.text)
+
+            if not page_has_ticker(ticker, text):
+                raise Exception("HTML do Status Invest não corresponde ao ticker solicitado")
+
+            rendimentos_12m = extract_rendimentos_12m(text)
+
+            if rendimentos_12m is not None and rendimentos_12m > 0:
+                log_ticker(
+                    ticker,
+                    "STATUSINVEST_SUPLEMENTO",
+                    "OK",
 
 def fetch_ticker(ticker):
     ticker = ticker.upper().strip()
@@ -552,8 +747,9 @@ def fetch_ticker(ticker):
     errors = []
     i10_data, i10_count, i10_error = fetch_investidor10(ticker)
     if i10_data and i10_data.get("Status") == "OK":
-        set_cache(ticker, i10_data)
-        return normalize_result(i10_data)
+    i10_data = complementar_rendimentos_12m_se_ausente(ticker, i10_data)
+    set_cache(ticker, i10_data)
+    return normalize_result(i10_data)
     if i10_data and i10_count > best_partial_count:
         best_partial = i10_data
         best_partial_count = i10_count
@@ -572,6 +768,7 @@ def fetch_ticker(ticker):
     if best_partial and best_partial_count > 0:
         best_partial["Status"] = "PARCIAL"
         best_partial["Erro"] = " | ".join(errors) if errors else "dados parciais"
+        best_partial = complementar_rendimentos_12m_se_ausente(ticker, best_partial)
         best_partial = clean_for_json(best_partial)
         log_ticker(ticker, "FINAL", "PARCIAL", f"{best_partial_count} campos reais capturados; sem dados inventados")
         set_cache(ticker, best_partial)
