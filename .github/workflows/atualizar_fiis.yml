@@ -1,8 +1,22 @@
 name: Atualizar Planilha de FIIs
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron Python    - cron: '30 22 * * *'     # Todo dia às 22:30 UTC (19h30 Brasília)
+    - cron: '30 22 * * *' # Todo dia às 22:30 UTC / 19h30 Brasília
+
+permissions:
+  contents: read
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -16,15 +30,3 @@ on:
 
       - name: Executar script de FIIs
         run: python update_fiis.py
-        env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-  workflow_dispatch:         # Permite rodar manualmente
-
-jobs:
-  atualizar:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Baixar código
-        uses: actions/checkout@v4
-
