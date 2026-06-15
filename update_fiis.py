@@ -4,358 +4,7 @@ import numpy as np
 import time
 import random
 import json
-import threading
-import os
-import re
-import html as html_lib
-import requests
-import math
-
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from google.oauth2.service_account import Credentials
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-
-# ================== CONFIG ==================
-
-SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
-
-TICKERS_SHEET = "FIIs"
-DATA_SHEET = "FIIs Dados"
-
-MAX_WORKERS = 3
-MAX_RETRIES = 4
-RATE_LIMIT = 2.2
-
-CACHE_FILE = "cache_fiis.json"
-CACHE_TTL = 60 * 60 * 6
-CACHE_SCHEMA_VERSION = 3
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-
-COLUMNS = [
-    "Ticker",
-    "Preço Atual",
-    "Dividend Yield 12M (%)",
-    "Rendimentos 12M",
-    "P/VP",
-    "Último Rendimento",
-    "Fonte",
-    "Atualizado em",
-    "Status",
-    "Erro"
-]
-
-CLEAR_RANGE = "A1:AB1000"
-
-
-# ================== LOG ==================
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-
-def log_ticker(ticker, fonte, status, detalhe=""):
-    detalhe_txt = f" | {detalhe}" if detalhe else ""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} | {fonte} | {status}{detalhe_txt}")
-
-
-# ================== JSON / SHEETS SAFETY ==================
-
-def clean_for_json(value):
-    if value is None:
-        return None
-
-    if value is pd.NA:
-        return None
-
-    if isinstance(value, dict):
-        return {str(k): clean_for_json(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [clean_for_json(v) for v in value]
-
-    if isinstance(value, tuple):
-        return [clean_for_json(v) for v in value]
-
-    if isinstance(value, np.integer):
-        return int(value)
-
-    if isinstance(value, np.floating):
-        value = float(value)
-
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
-
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-
-    return value
-
-
-def validate_json_safe(data):
-    json.dumps(data, allow_nan=False)
-
-def validate_json_safe(data):
-    json.dumps(data, allow_nan=False)
-
-
-# ================== AUTH ==================
-
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-client = gspread.authorize(creds)
-
-spreadsheet = client.open_by_key(SHEET_ID)
-sheet_fiis = spreadsheet.worksheet(TICKERS_SHEET)
-sheet_dados = spreadsheet.worksheet(DATA_SHEET)
-
-
-# ================== RATE LIMIT GLOBAL ==================
-
-rate_lock = threading.Lock()
-last_call = [0]
-
-
-def rate_limiter():
-    with rate_lock:
-        now = time.time()
-        elapsed = now - last_call[0]
-
-        if elapsed < RATE_LIMIT:
-            time.sleep(RATE_LIMIT - elapsed)
-
-        last_call[0] = time.time()
-
-
-# ================== CACHE ==================
-
-cache_lock = threading.Lock()
-
-
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
-        return {}
-
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"CACHE | ERRO AO LER CACHE | {e}")
-        return {}
-
-
-def save_cache(cache_data):
-    try:
-        cache_data = clean_for_json(cache_data)
-
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                cache_data,
-                f,
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False
-            )
-    except Exception as e:
-        log(f"CACHE | ERRO AO SALVAR CACHE | {e}")
-
-
-cache = load_cache()
-
-
-def get_cached(ticker):
-    ticker = ticker.upper().strip()
-
-    with cache_lock:
-        data = cache.get(ticker)
-
-    if not data:
-        return None
-
-    schema_version = data.get("schema_version", 0)
-
-    if schema_version < CACHE_SCHEMA_VERSION:
-        log_ticker(ticker, "CACHE", "IGNORADO", "schema antigo")
-        return None
-
-    timestamp = data.get("timestamp", 0)
-
-    if time.time() - timestamp > CACHE_TTL:
-        log_ticker(ticker, "CACHE", "EXPIRADO")
-        return None
-
-    payload = data.get("payload")
-
-    if not payload:
-        return None
-
-    result = dict(payload)
-    fonte = result.get("Fonte", "DESCONHECIDA")
-    result["Status"] = f"CACHE_{fonte.upper()}"
-
-    return normalize_result(result)
-
-
-def set_cache(ticker, payload):
-    ticker = ticker.upper().strip()
-    payload_to_save = clean_for_json(dict(payload))
-
-    with cache_lock:
-        cache[ticker] = {
-            "schema_version": CACHE_SCHEMA_VERSION,
-            "timestamp": time.time(),
-            "payload": payload_to_save
-        }
-        save_cache(cache)
-
-
-# ================== UTILS ==================
-
-def sanitize_ticker(raw):
-    if raw is None:
-        return ""
-
-    s = str(raw).strip().upper()
-
-    # Correção defensiva para digitação tipo HGRE!!
-    if re.match(r"^[A-Z]{4}!!$", s):
-        s = s.replace("!!", "11")
-
-    s = re.sub(r"[^A-Z0-9]", "", s)
-
-    return s
-
-
-def parse_br_number(value):
-    if value is None:
-        return None
-
-    s = str(value).strip()
-
-    if not s or s in ["-", "--", "N/A", "n/a", "None", "nan", "NaN"]:
-        return None
-
-    s = s.replace("%", "")
-    s = s.replace("R$", "")
-    s = s.replace("R", "")
-    s = s.replace(" ", "")
-    s = s.replace("\xa0", "")
-
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    elif s.count(".") > 1:
-        s = s.replace(".", "")
-    elif s.count(".") == 1:
-        partes = s.split(".")
-        if len(partes) == 2 and len(partes[1]) == 3 and len(partes[0]) <= 3:
-            s = s.replace(".", "")
-
-    try:
-        number = float(s)
-
-        if math.isnan(number) or math.isinf(number):
-            return None
-
-        return round(number, 6)
-    except Exception:
-        return None
-
-
-def plausible(value, min_value=None, max_value=None):
-    if value is None:
-        return None
-
-    try:
-        v = float(value)
-    except Exception:
-        return None
-
-    if math.isnan(v) or math.isinf(v):
-        return None
-
-    if min_value is not None and v < min_value:
-        return None
-
-    if max_value is not None and v > max_value:
-        return None
-
-    return round(v, 6)
-
-
-def sanitize_df(df):
-    df = df.copy()
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.astype(object)
-    df = df.where(pd.notnull(df), None)
-    return df
-
-
-def html_to_text(raw_html):
-    if BeautifulSoup:
-        soup = BeautifulSoup(raw_html, "html.parser")
-
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-
-        text = soup.get_text(" ", strip=True)
-    else:
-        text = re.sub(r"<script.*?</script>", " ", raw_html, flags=re.I | re.S)
-        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
-        text = re.sub(r"<[^>]+>", " ", text)
-
-    text = html_lib.unescape(text)
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def build_headers():
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive"
-    }
-
-
-def number_pattern():
-    return r"(-?\d[\d\.\,]*)"
-
-
-def validate_page_for_ticker(ticker, text, fonte):
-    ticker = ticker.upper().strip()
-    text_upper = str(text or "").upper()
-
-    evidencias = [
-        ticker,
-        f"COTAÇÃO DO {ticker}",
-        f"DIVIDENDOS DO {ticker}",
-        f"{ticker}:",
-        f"{ticker} COTAÇÃO",
-        f"FUNDOS IMOBILIÁRIOS {ticker}",
-        f"HOME FUNDOS IMOBILIÁRIOS {ticker}",
-    ]
-
-    if any(e in text_upper for e in evidencias):
+(e in text_upper for e in evidencias):import threading
         return True
 
     log_ticker(
@@ -512,6 +161,7 @@ def load_tickers():
         if ticker and len(ticker) > 1:
             tickers.append(ticker)
 
+    # Remove duplicados preservando ordem
     tickers = list(dict.fromkeys(tickers))
 
     return tickers
@@ -1052,7 +702,7 @@ RATE_LIMIT = 2.2
 
 CACHE_FILE = "cache_fiis.json"
 CACHE_TTL = 60 * 60 * 6
-CACHE_SCHEMA_VERSION = 3  # versão simplificada e mais rígida
+CACHE_SCHEMA_VERSION = 4
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -1072,9 +722,8 @@ COLUMNS = [
     "Erro"
 ]
 
-# Importante:
-# Como a versão anterior gravava até AB, esta limpeza remove colunas antigas contaminadas.
-# Quando reconstruirmos o Apps Script novo, podemos trocar para A1:J1000 se quiser preservar scores.
+# Limpa também colunas antigas da versão anterior até AB.
+# Depois que validar tudo e refizer o Apps Script, pode trocar para A1:J1000.
 CLEAR_RANGE = "A1:AB1000"
 
 
@@ -1114,3 +763,262 @@ def clean_for_json(value):
         value = float(value)
 
     if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return value
+
+
+def validate_json_safe(data):
+    json.dumps(data, allow_nan=False)
+
+
+# ================== AUTH ==================
+
+creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+client = gspread.authorize(creds)
+
+spreadsheet = client.open_by_key(SHEET_ID)
+sheet_fiis = spreadsheet.worksheet(TICKERS_SHEET)
+sheet_dados = spreadsheet.worksheet(DATA_SHEET)
+
+
+# ================== RATE LIMIT GLOBAL ==================
+
+rate_lock = threading.Lock()
+last_call = [0]
+
+
+def rate_limiter():
+    with rate_lock:
+        now = time.time()
+        elapsed = now - last_call[0]
+
+        if elapsed < RATE_LIMIT:
+            time.sleep(RATE_LIMIT - elapsed)
+
+        last_call[0] = time.time()
+
+
+# ================== CACHE ==================
+
+cache_lock = threading.Lock()
+
+
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"CACHE | ERRO AO LER CACHE | {e}")
+        return {}
+
+
+def save_cache(cache_data):
+    try:
+        cache_data = clean_for_json(cache_data)
+
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                cache_data,
+                f,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False
+            )
+    except Exception as e:
+        log(f"CACHE | ERRO AO SALVAR CACHE | {e}")
+
+
+cache = load_cache()
+
+
+def get_cached(ticker):
+    ticker = ticker.upper().strip()
+
+    with cache_lock:
+        data = cache.get(ticker)
+
+    if not data:
+        return None
+
+    schema_version = data.get("schema_version", 0)
+
+    if schema_version < CACHE_SCHEMA_VERSION:
+        log_ticker(ticker, "CACHE", "IGNORADO", "schema antigo")
+        return None
+
+    timestamp = data.get("timestamp", 0)
+
+    if time.time() - timestamp > CACHE_TTL:
+        log_ticker(ticker, "CACHE", "EXPIRADO")
+        return None
+
+    payload = data.get("payload")
+
+    if not payload:
+        return None
+
+    result = dict(payload)
+    fonte = result.get("Fonte", "DESCONHECIDA")
+    result["Status"] = f"CACHE_{fonte.upper()}"
+
+    return normalize_result(result)
+
+
+def set_cache(ticker, payload):
+    ticker = ticker.upper().strip()
+    payload_to_save = clean_for_json(dict(payload))
+
+    with cache_lock:
+        cache[ticker] = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "timestamp": time.time(),
+            "payload": payload_to_save
+        }
+        save_cache(cache)
+
+
+# ================== UTILS ==================
+
+def sanitize_ticker(raw):
+    if raw is None:
+        return ""
+
+    s = str(raw).strip().upper()
+
+    # Correção defensiva para erro comum tipo HGRE!!
+    if re.match(r"^[A-Z]{4}!!$", s):
+        s = s.replace("!!", "11")
+
+    s = re.sub(r"[^A-Z0-9]", "", s)
+
+    return s
+
+
+def parse_br_number(value):
+    if value is None:
+        return None
+
+    s = str(value).strip()
+
+    if not s or s in ["-", "--", "N/A", "n/a", "None", "nan", "NaN"]:
+        return None
+
+    s = s.replace("%", "")
+    s = s.replace("R$", "")
+    s = s.replace("R", "")
+    s = s.replace(" ", "")
+    s = s.replace("\xa0", "")
+
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    elif s.count(".") > 1:
+        s = s.replace(".", "")
+    elif s.count(".") == 1:
+        partes = s.split(".")
+        if len(partes) == 2 and len(partes[1]) == 3 and len(partes[0]) <= 3:
+            s = s.replace(".", "")
+
+    try:
+        number = float(s)
+
+        if math.isnan(number) or math.isinf(number):
+            return None
+
+        return round(number, 6)
+    except Exception:
+        return None
+
+
+def plausible(value, min_value=None, max_value=None):
+    if value is None:
+        return None
+
+    try:
+        v = float(value)
+    except Exception:
+        return None
+
+    if math.isnan(v) or math.isinf(v):
+        return None
+
+    if min_value is not None and v < min_value:
+        return None
+
+    if max_value is not None and v > max_value:
+        return None
+
+    return round(v, 6)
+
+
+def sanitize_df(df):
+    df = df.copy()
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.astype(object)
+    df = df.where(pd.notnull(df), None)
+    return df
+
+
+def html_to_text(raw_html):
+    if BeautifulSoup:
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        text = soup.get_text(" ", strip=True)
+    else:
+        text = re.sub(r"<script.*?</script>", " ", raw_html, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+
+    text = html_lib.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def build_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive"
+    }
+
+
+def number_pattern():
+    return r"(-?\d[\d\.\,]*)"
+
+
+def validate_page_for_ticker(ticker, text, fonte):
+    ticker = ticker.upper().strip()
+    text_upper = str(text or "").upper()
+
+    evidencias = [
+        ticker,
+        f"COTAÇÃO DO {ticker}",
+        f"DIVIDENDOS DO {ticker}",
+        f"{ticker}:",
+        f"{ticker} COTAÇÃO",
+        f"FUNDOS IMOBILIÁRIOS {ticker}",
+        f"HOME FUNDOS IMOBILIÁRIOS {ticker}",
+    ]
+
