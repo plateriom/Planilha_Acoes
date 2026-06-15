@@ -10,6 +10,7 @@ import os
 import re
 import html as html_lib
 import requests
+import math
 
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,6 +71,56 @@ def log_ticker(ticker, fonte, status, detalhe=""):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {ticker} | {fonte} | {status}{detalhe_txt}")
 
 
+# ================== JSON / SHEETS SAFETY ==================
+
+def clean_for_json(value):
+    """
+    Remove NaN, inf, -inf, pd.NA e tipos numpy antes de enviar ao Google Sheets
+    ou salvar no cache.
+    """
+    if value is None:
+        return None
+
+    if value is pd.NA:
+        return None
+
+    if isinstance(value, dict):
+        return {str(k): clean_for_json(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, tuple):
+        return [clean_for_json(v) for v in value]
+
+    if isinstance(value, np.integer):
+        return int(value)
+
+    if isinstance(value, np.floating):
+        value = float(value)
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return value
+
+
+def validate_json_safe(data):
+    """
+    Valida antes de limpar a planilha.
+    Se ainda houver NaN/inf, falha aqui antes de apagar qualquer coisa.
+    """
+    json.dumps(data, allow_nan=False)
+
+
 # ================== AUTH ==================
 
 creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
@@ -114,10 +165,18 @@ def load_cache():
         return {}
 
 
-def save_cache(cache):
+def save_cache(cache_data):
     try:
+        cache_data = clean_for_json(cache_data)
+
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
+            json.dump(
+                cache_data,
+                f,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False
+            )
     except Exception as e:
         log(f"CACHE | ERRO AO SALVAR CACHE | {e}")
 
@@ -148,13 +207,13 @@ def get_cached(ticker):
     fonte = result.get("Fonte", "DESCONHECIDA")
     result["Status"] = f"CACHE_{fonte.upper()}"
 
-    return result
+    return clean_for_json(result)
 
 
 def set_cache(ticker, payload):
     ticker = ticker.upper().strip()
 
-    payload_to_save = dict(payload)
+    payload_to_save = clean_for_json(dict(payload))
 
     with cache_lock:
         cache[ticker] = {
@@ -167,19 +226,27 @@ def set_cache(ticker, payload):
 # ================== UTILS ==================
 
 def safe_percent(v):
-    if isinstance(v, (int, float)) and not pd.isna(v):
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        v = float(v)
+        if math.isnan(v) or math.isinf(v):
+            return None
         return round(v * 100, 2)
     return None
 
 
 def safe_round(v):
-    if isinstance(v, (int, float)) and not pd.isna(v):
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        v = float(v)
+        if math.isnan(v) or math.isinf(v):
+            return None
         return round(v, 2)
     return None
 
 
-def sanitize(df):
+def sanitize_df(df):
+    df = df.copy()
     df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.astype(object)
     df = df.where(pd.notnull(df), None)
     return df
 
@@ -190,7 +257,7 @@ def parse_br_number(value):
 
     s = str(value).strip()
 
-    if not s or s in ["-", "--", "N/A", "n/a", "None"]:
+    if not s or s in ["-", "--", "N/A", "n/a", "None", "nan", "NaN"]:
         return None
 
     s = s.replace("%", "")
@@ -204,13 +271,19 @@ def parse_br_number(value):
         s = s.replace(",", ".")
 
     try:
-        return round(float(s), 2)
+        number = float(s)
+
+        if math.isnan(number) or math.isinf(number):
+            return None
+
+        return round(number, 2)
     except Exception:
         return None
 
 
 def count_valid_fields(data):
     ignored = {"Ticker", "Fonte", "Atualizado em", "Status", "Erro"}
+
     return sum(
         1 for k, v in data.items()
         if k not in ignored and v is not None
@@ -223,7 +296,7 @@ def normalize_result(data):
     for col in COLUMNS:
         result[col] = data.get(col)
 
-    return result
+    return clean_for_json(result)
 
 
 def html_to_text(raw_html):
@@ -325,6 +398,9 @@ def fetch_investidor10(ticker):
             if response.status_code == 404:
                 raise Exception("ticker não encontrado no Investidor10")
 
+            if response.status_code == 410:
+                raise Exception("ativo indisponível/removido no Investidor10 HTTP 410")
+
             response.raise_for_status()
 
             text = html_to_text(response.text)
@@ -345,6 +421,8 @@ def fetch_investidor10(ticker):
                 "Status": "OK",
                 "Erro": None
             }
+
+            data = clean_for_json(data)
 
             valid_count = count_valid_fields(data)
 
@@ -384,6 +462,16 @@ def fetch_investidor10(ticker):
         except Exception as e:
             last_error = str(e)
 
+            # HTTP 410/404 normalmente é permanente. Não adianta insistir.
+            if "HTTP 410" in last_error or "não encontrado" in last_error:
+                log_ticker(
+                    ticker,
+                    "INVESTIDOR10",
+                    "FALHOU SEM RETRY",
+                    last_error
+                )
+                break
+
             if attempt < MAX_RETRIES - 1:
                 sleep_time = (3 ** attempt) + random.uniform(1, 2)
                 log_ticker(
@@ -420,21 +508,8 @@ def fetch_yahoo(ticker):
                 f"{ticker}.SA"
             )
 
-            sessao = requests.Session()
-            sessao.headers.update(build_headers())
-
-            try:
-                t = yf.Ticker(f"{ticker}.SA", session=sessao)
-                info = t.info
-            except Exception as session_error:
-                log_ticker(
-                    ticker,
-                    "YAHOO",
-                    "SESSÃO CUSTOM FALHOU",
-                    f"tentando sem sessão | {session_error}"
-                )
-                t = yf.Ticker(f"{ticker}.SA")
-                info = t.info
+            t = yf.Ticker(f"{ticker}.SA")
+            info = t.info
 
             if not isinstance(info, dict) or not info:
                 raise Exception("Yahoo retornou info vazio")
@@ -457,6 +532,8 @@ def fetch_yahoo(ticker):
                 "Status": "OK",
                 "Erro": None
             }
+
+            data = clean_for_json(data)
 
             valid_count = count_valid_fields(data)
 
@@ -576,6 +653,8 @@ def fetch_ticker(ticker):
         best_partial["Status"] = "PARCIAL"
         best_partial["Erro"] = " | ".join(errors) if errors else "dados parciais"
 
+        best_partial = clean_for_json(best_partial)
+
         log_ticker(
             ticker,
             "FINAL",
@@ -616,6 +695,7 @@ def fetch_all(tickers):
         for i, future in enumerate(as_completed(futures)):
             try:
                 result = future.result()
+                result = clean_for_json(result)
                 results.append(result)
 
                 ticker = result.get("Ticker", "DESCONHECIDO")
@@ -637,9 +717,15 @@ def fetch_all(tickers):
 
 def write_sheet(df):
     df = df.reindex(columns=COLUMNS)
-    df = sanitize(df)
+    df = sanitize_df(df)
 
-    data = [df.columns.tolist()] + df.values.tolist()
+    raw_data = [df.columns.tolist()] + df.values.tolist()
+    data = clean_for_json(raw_data)
+
+    log("PLANILHA | validando JSON antes de limpar a aba")
+    validate_json_safe(data)
+
+    log("PLANILHA | JSON validado com sucesso")
 
     log("PLANILHA | limpando intervalo A1:Z1000")
     sheet_dados.batch_clear(["A1:Z1000"])
@@ -673,8 +759,11 @@ def main():
 
     results = fetch_all(tickers)
 
+    results = clean_for_json(results)
+
     df = pd.DataFrame(results)
     df = df.reindex(columns=COLUMNS)
+    df = sanitize_df(df)
 
     log("DATAFRAME | resumo de status:")
 
