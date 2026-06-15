@@ -674,6 +674,7 @@ def fetch_ticker(ticker):
     best_partial_count = 0
     errors = []
 
+    # 1) Fonte principal: Investidor10
     i10_data, i10_count, i10_error = fetch_investidor10(ticker)
 
     if i10_data and i10_count >= MIN_VALID_FIELDS:
@@ -694,6 +695,7 @@ def fetch_ticker(ticker):
         "Investidor10 insuficiente ou indisponível"
     )
 
+    # 2) Fallback: Yahoo
     yahoo_data, yahoo_count, yahoo_error = fetch_yahoo(ticker)
 
     if yahoo_data and yahoo_count >= MIN_VALID_FIELDS:
@@ -707,6 +709,7 @@ def fetch_ticker(ticker):
     if yahoo_error:
         errors.append(f"Yahoo: {yahoo_error}")
 
+    # 3) Se tiver dado real parcial, grava parcial
     if best_partial and best_partial_count > 0:
         best_partial["Status"] = "PARCIAL"
         best_partial["Erro"] = " | ".join(errors) if errors else "dados parciais"
@@ -723,6 +726,7 @@ def fetch_ticker(ticker):
         set_cache(ticker, best_partial)
         return normalize_result(best_partial)
 
+    # 4) Se nada deu certo, retorna erro fail-safe
     error_msg = " | ".join(errors) if errors else "nenhuma fonte retornou dados reais"
 
     log_ticker(
@@ -741,10 +745,15 @@ def fetch_ticker(ticker):
         "Erro": error_msg
     })
 
-# ================== PARALLEL ==================
+
+# ================== PARALLEL COM ORDEM PRESERVADA ==================
 
 def fetch_all(tickers):
-    # Mantém a ordem original da aba AÇÕES
+    """
+    Executa as consultas em paralelo, mas preserva exatamente
+    a ordem original dos tickers carregados da aba AÇÕES.
+    """
+
     results = [None] * len(tickers)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -764,7 +773,8 @@ def fetch_all(tickers):
                 result = future.result()
                 result = clean_for_json(result)
 
-                # Garante que o resultado volte para a posição original
+                # Aqui está o ajuste principal:
+                # o resultado volta para a mesma posição original do ticker.
                 results[index] = result
 
                 completed += 1
@@ -790,7 +800,6 @@ def fetch_all(tickers):
                     f"falha crítica no future: {e}"
                 )
 
-                # Mesmo em erro, preserva a posição original
                 results[index] = normalize_result({
                     "Ticker": ticker_original,
                     "Preço Atual": None,
@@ -800,20 +809,22 @@ def fetch_all(tickers):
                     "Erro": f"falha crítica no future: {e}"
                 })
 
-    # Remove qualquer None residual, mas sem alterar a ordem dos existentes
-    results = [
-        result if result is not None else normalize_result({
-            "Ticker": tickers[i],
-            "Preço Atual": None,
-            "Fonte": None,
-            "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "Status": "ERRO",
-            "Erro": "resultado ausente após execução paralela"
-        })
-        for i, result in enumerate(results)
-    ]
+    # Segurança final: nenhum slot pode ficar vazio.
+    for i, result in enumerate(results):
+        if result is None:
+            ticker_original = tickers[i]
+
+            results[i] = normalize_result({
+                "Ticker": ticker_original,
+                "Preço Atual": None,
+                "Fonte": None,
+                "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                "Status": "ERRO",
+                "Erro": "resultado ausente após execução paralela"
+            })
 
     return results
+
 
 # ================== WRITE ==================
 
@@ -829,8 +840,10 @@ def write_sheet(df):
 
     log("PLANILHA | JSON validado com sucesso")
 
-    log("PLANILHA | limpando intervalo A1:Z1000")
-    sheet_dados.batch_clear(["A1:Z1000"])
+    # Limpa somente as colunas brutas do Python: A até O.
+    # Isso evita apagar as colunas de score criadas pelo Apps Script.
+    log("PLANILHA | limpando intervalo bruto A1:O1000")
+    sheet_dados.batch_clear(["A1:O1000"])
 
     log(f"PLANILHA | gravando {len(df)} linhas e {len(COLUMNS)} colunas")
     sheet_dados.update(
@@ -854,20 +867,32 @@ def main():
         return
 
     log(f"TICKERS | {len(tickers)} ativos encontrados")
+    log("ORDEM | a ordem da aba AÇÕES será preservada na aba Dados")
     log("ORDEM DE FONTES | 1º Investidor10 | 2º Yahoo | 3º ERRO/PARCIAL fail-safe")
-    log("NOVA COLUNA | Preço Atual será buscado junto dos fundamentos")
+    log("COLUNA | Preço Atual será buscado junto dos fundamentos")
     log(f"CACHE | TTL configurado: {round(CACHE_TTL / 3600, 1)} horas")
     log(f"CACHE | schema version exigido: {CACHE_SCHEMA_VERSION}")
     log(f"RATE LIMIT | intervalo global mínimo: {RATE_LIMIT}s")
     log(f"THREADS | max_workers: {MAX_WORKERS}")
 
     results = fetch_all(tickers)
-
     results = clean_for_json(results)
 
     df = pd.DataFrame(results)
     df = df.reindex(columns=COLUMNS)
     df = sanitize_df(df)
+
+    # Segurança extra: reforça a ordenação conforme a aba AÇÕES.
+    try:
+        ordem_tickers = {ticker: index for index, ticker in enumerate(tickers)}
+
+        df["_ordem_original"] = df["Ticker"].map(ordem_tickers)
+        df = df.sort_values("_ordem_original", kind="stable")
+        df = df.drop(columns=["_ordem_original"])
+
+        log("ORDEM | DataFrame reordenado conforme aba AÇÕES")
+    except Exception as e:
+        log(f"ORDEM | falha ao reforçar ordenação: {e}")
 
     log("DATAFRAME | resumo de status:")
 
@@ -880,6 +905,7 @@ def main():
 
     try:
         sem_preco = df[df["Preço Atual"].isna()]["Ticker"].tolist()
+
         if sem_preco:
             log(f"PREÇO | ativos sem preço capturado: {', '.join(sem_preco)}")
         else:
