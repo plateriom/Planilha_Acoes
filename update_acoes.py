@@ -116,7 +116,7 @@ def load_tickers():
         if r and str(r[0]).strip()
     ]
 
-# ================== FETCH COM FALLBACK ==================
+# ================== FETCH ==================
 def fetch_ticker(ticker):
 
     cached = get_cached(ticker)
@@ -128,8 +128,7 @@ def fetch_ticker(ticker):
         try:
             rate_limiter()
             t = yf.Ticker(f"{ticker}.SA")
-
-            info = t.info  # fonte principal
+            info = t.info
 
             div = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
 
@@ -144,7 +143,6 @@ def fetch_ticker(ticker):
                 "Atualizado em": datetime.now().strftime("%d/%m/%Y %H:%M")
             }
 
-            # ✅ FAIL-SAFE → se dado essencial faltou: considera erro
             if None in [
                 data["ROE (%)"],
                 data["Margem Líquida (%)"],
@@ -159,7 +157,6 @@ def fetch_ticker(ticker):
         except:
             time.sleep(2 + random.uniform(0.5, 1.5))
 
-    # fallback final → retorna tudo None (score 0)
     return {
         "Ticker": ticker,
         "Margem Líquida (%)": None,
@@ -182,7 +179,6 @@ def filtro(row):
         row.get("Margem Líquida (%)") >= 0
     )
 
-# ✅ SCORE AJUSTADO (dividendos com mais peso, SEM mudar filosofia)
 def score_base(row):
     score = 0
 
@@ -191,7 +187,6 @@ def score_base(row):
     pvp = row.get("P/VP")
     dy = row.get("Div Yield 12M (%)")
 
-    # QUALIDADE (35)
     if roe > 20: score += 18
     elif roe > 15: score += 14
     elif roe > 10: score += 10
@@ -201,13 +196,11 @@ def score_base(row):
     elif margem > 10: score += 13
     elif margem > 5: score += 9
 
-    # VALUATION (15)
     if pvp < 1: score += 15
     elif pvp < 1.5: score += 12
     elif pvp < 2: score += 8
     elif pvp > 3: score -= 10
 
-    # DIVIDENDOS (30) ← ajuste solicitado
     if dy > 10: score += 30
     elif dy > 8: score += 25
     elif dy > 6: score += 20
@@ -217,23 +210,34 @@ def score_base(row):
 
     return max(0, min(100, score))
 
+# ✅ CORREÇÃO AQUI
 def ajuste_setor(row, score):
-    setor = SETOR_MAP.get(row["Ticker"], "Outro")
+
+    if score == 0:
+        return 0, "Sem dados"
+
+    setor = SETOR_MAP.get(row.get("Ticker"), "Outro")
     regras = PESO_SETOR.get(setor, {})
 
     roe = row.get("ROE (%)")
     pvp = row.get("P/VP")
 
-    score += 5 if roe >= regras.get("roe_min", 0) else -5
-    score += 5 if pvp <= regras.get("pvp_max", 10) else -5
+    ajuste = 0
 
-    return max(0, min(100, score)), setor
+    if roe is not None:
+        ajuste += 5 if roe >= regras.get("roe_min", 0) else -5
+
+    if pvp is not None:
+        ajuste += 5 if pvp <= regras.get("pvp_max", 10) else -5
+
+    return max(0, min(100, score + ajuste)), setor
 
 def momentum(ticker, score):
-    try:
-        if score == 0:
-            return 0
 
+    if score == 0:
+        return 0
+
+    try:
         d = yf.download(f"{ticker}.SA", period="3mo", progress=False)
 
         if d.empty:
@@ -275,7 +279,6 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # ENGINE
     df["Valido"] = df.apply(filtro, axis=1)
 
     df["Score Base"] = df.apply(
@@ -297,14 +300,13 @@ def main():
     df = sanitize(df)
     df = df.sort_values(by="Score Final", ascending=False)
 
-    # WRITE
     data = [df.columns.tolist()] + df.values.tolist()
     sheet_dados.batch_clear(["A1:Z1000"])
     sheet_dados.update("A1", data)
 
     save_cache(cache)
 
-    log("✅ FINALIZADO COM FAIL-SAFE ATIVO")
+    log("✅ FINALIZADO (FAIL-SAFE + SEM ERROS)")
 
 if __name__ == "__main__":
     main()
