@@ -4,24 +4,32 @@ import pandas as pd
 import numpy as np
 import time
 import random
+import json
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
+import os
 
 # ================== CONFIG ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
 TICKERS_SHEET = "AÇÕES"
 DATA_SHEET = "Dados"
 
-MAX_WORKERS = 5
-MAX_RETRIES = 3
+MAX_WORKERS = 3
+MAX_RETRIES = 4
+RATE_LIMIT = 2.2  # intervalo global entre chamadas
+CACHE_FILE = "cache_fundamentals.json"
+CACHE_TTL = 60 * 60 * 6  # 6h
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
 
-print("🚀 Inicializando engine institucional...")
+# ================== LOG ==================
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ================== AUTH ==================
 creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
@@ -31,22 +39,62 @@ spreadsheet = client.open_by_key(SHEET_ID)
 sheet_acoes = spreadsheet.worksheet(TICKERS_SHEET)
 sheet_dados = spreadsheet.worksheet(DATA_SHEET)
 
+# ================== RATE LIMIT GLOBAL ==================
+lock = threading.Lock()
+last_call = [0]
+
+def rate_limiter():
+    with lock:
+        now = time.time()
+        elapsed = now - last_call[0]
+
+        if elapsed < RATE_LIMIT:
+            time.sleep(RATE_LIMIT - elapsed)
+
+        last_call[0] = time.time()
+
+# ================== CACHE ==================
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    with open(CACHE_FILE, "r") as f:
+        return json.load(f)
+
+def save_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+cache = load_cache()
+
+def get_cached(ticker):
+    data = cache.get(ticker)
+    if not data:
+        return None
+
+    timestamp = data.get("timestamp", 0)
+    if time.time() - timestamp > CACHE_TTL:
+        return None
+
+    return data.get("payload")
+
+def set_cache(ticker, payload):
+    cache[ticker] = {
+        "timestamp": time.time(),
+        "payload": payload
+    }
+
 # ================== UTILS ==================
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+def safe_percent(v):
+    return round(v * 100, 2) if isinstance(v, (int, float)) else None
 
-def safe_percent(value):
-    return round(value * 100, 2) if isinstance(value, (int, float)) else None
-
-def safe_round(value):
-    return round(value, 2) if isinstance(value, (int, float)) else None
+def safe_round(v):
+    return round(v, 2) if isinstance(v, (int, float)) else None
 
 def sanitize(df):
     return df.replace([np.inf, -np.inf, np.nan], None)
 
 # ================== LOAD TICKERS ==================
 def load_tickers():
-    log("Carregando tickers...")
     values = sheet_acoes.get_all_values()
 
     tickers = [
@@ -56,20 +104,26 @@ def load_tickers():
     ]
 
     tickers = list(dict.fromkeys([t for t in tickers if len(t) > 1]))
-
-    log(f"{len(tickers)} tickers válidos carregados")
     return tickers
 
 # ================== FETCH ==================
 def fetch_ticker(ticker):
+    # CACHE
+    cached = get_cached(ticker)
+    if cached:
+        cached["Status"] = "CACHE"
+        return cached
+
     for attempt in range(MAX_RETRIES):
         try:
+            rate_limiter()
+
             t = yf.Ticker(f"{ticker}.SA")
             info = t.info
 
             div_yield = info.get('trailingAnnualDividendYield') or info.get('dividendYield')
 
-            return {
+            data = {
                 "Ticker": ticker,
                 "Margem Líquida (%)": safe_percent(info.get('profitMargins')),
                 "ROE (%)": safe_percent(info.get('returnOnEquity')),
@@ -80,9 +134,12 @@ def fetch_ticker(ticker):
                 "Status": "OK"
             }
 
+            set_cache(ticker, data)
+            return data
+
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
-                sleep_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+                sleep_time = (3 ** attempt) + random.uniform(1, 2)
                 log(f"{ticker} retry {attempt+1} em {round(sleep_time,1)}s")
                 time.sleep(sleep_time)
             else:
@@ -92,37 +149,31 @@ def fetch_ticker(ticker):
                     "Erro": str(e)
                 }
 
-# ================== PARALLEL ENGINE ==================
+# ================== PARALLEL ==================
 def fetch_all(tickers):
-    log("Iniciando coleta paralela...")
     results = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_ticker, t): t for t in tickers}
+        futures = [executor.submit(fetch_ticker, t) for t in tickers]
 
         for i, future in enumerate(as_completed(futures)):
-            ticker = futures[future]
             try:
-                data = future.result()
-                results.append(data)
-                log(f"[{i+1}/{len(tickers)}] {ticker} ✅")
+                result = future.result()
+                results.append(result)
+                log(f"[{i+1}/{len(tickers)}] {result['Ticker']} ✅")
             except Exception as e:
-                log(f"{ticker} falhou geral: {e}")
-                results.append({"Ticker": ticker, "Status": "FALHA CRÍTICA"})
+                log(f"Falha crítica: {e}")
 
     return results
 
 # ================== WRITE ==================
 def write_sheet(df):
-    log("Sanitizando dados...")
     df = sanitize(df)
-
-    log("Escrevendo no Google Sheets...")
 
     data = [df.columns.tolist()] + df.values.tolist()
 
-    # limpa somente o necessário (mais seguro)
-    sheet_dados.batch_clear(["A:Z"])
+    # NÃO apaga tudo cegamente → mais seguro
+    sheet_dados.batch_clear(["A1:Z1000"])
 
     sheet_dados.update(
         range_name="A1",
@@ -130,26 +181,30 @@ def write_sheet(df):
         value_input_option="RAW"
     )
 
-    log("✅ Escrita concluída")
-
 # ================== MAIN ==================
 def main():
     start = time.time()
 
+    log("Carregando tickers...")
     tickers = load_tickers()
 
     if not tickers:
-        log("⚠️ Nenhum ticker encontrado")
+        log("Nenhum ticker encontrado")
         return
+
+    log(f"{len(tickers)} ativos")
 
     results = fetch_all(tickers)
 
     df = pd.DataFrame(results)
 
+    log("Gravando na planilha...")
     write_sheet(df)
 
+    save_cache(cache)
+
     elapsed = round(time.time() - start, 2)
-    log(f"🏁 Finalizado em {elapsed}s")
+    log(f"Finalizado em {elapsed}s")
 
 # ================== RUN ==================
 if __name__ == "__main__":
