@@ -31,16 +31,24 @@ SCOPES = [
 # ================== SETORES ==================
 SETOR_MAP = {
     "BBAS3": "Bancos", "ITUB4": "Bancos", "SANB11": "Bancos",
+    "BBSE3": "Seguros", "CXSE3": "Seguros", "PSSA3": "Seguros",
+    "TAEE11": "Energia", "TRPL11": "Energia", "EGIE3": "Energia",
+    "SBSP3": "Saneamento", "CSMG3": "Saneamento",
     "VALE3": "Commodities", "PETR4": "Commodities",
+    "VIVT3": "Telecom",
     "WEGE3": "Industrial",
-    "ABEV3": "Consumo"
+    "ABEV3": "Consumo Defensivo"
 }
 
 PESO_SETOR = {
     "Bancos": {"roe_min": 15, "pvp_max": 1.5},
+    "Seguros": {"roe_min": 15, "pvp_max": 2.5},
+    "Energia": {"roe_min": 8, "pvp_max": 1.8},
+    "Saneamento": {"roe_min": 8, "pvp_max": 2.0},
     "Commodities": {"roe_min": 10, "pvp_max": 2.0},
     "Industrial": {"roe_min": 12, "pvp_max": 2.5},
-    "Consumo": {"roe_min": 10, "pvp_max": 3.0},
+    "Consumo Defensivo": {"roe_min": 12, "pvp_max": 3.0},
+    "Telecom": {"roe_min": 8, "pvp_max": 2.2}
 }
 
 # ================== LOG ==================
@@ -154,6 +162,7 @@ def fetch_ticker(ticker):
                 }
 
 # ================== ENGINE ==================
+
 def filtro(row):
     return not (
         row.get("ROE (%)") is None or row.get("ROE (%)") < 5 or
@@ -161,44 +170,53 @@ def filtro(row):
         row.get("P/VP") is None
     )
 
+# 🔥 SCORE AJUSTADO (DIVIDENDOS MAIS RELEVANTES)
 def score_base(row):
     score = 0
+
     roe = row.get("ROE (%)")
     margem = row.get("Margem Líquida (%)")
     pvp = row.get("P/VP")
     dy = row.get("Div Yield 12M (%)")
 
+    # QUALIDADE (35)
     if roe:
-        score += 20 if roe > 20 else 15 if roe > 15 else 10 if roe > 10 else 5
+        if roe > 20: score += 18
+        elif roe > 15: score += 14
+        elif roe > 10: score += 10
+        else: score += 5
 
     if margem:
-        score += 20 if margem > 20 else 15 if margem > 10 else 10 if margem > 5 else 0
+        if margem > 20: score += 17
+        elif margem > 10: score += 13
+        elif margem > 5: score += 9
 
+    # VALUATION (15)
     if pvp:
-        score += 20 if pvp < 1 else 15 if pvp < 1.5 else 10 if pvp < 2 else -10 if pvp > 3 else 0
+        if pvp < 1: score += 15
+        elif pvp < 1.5: score += 12
+        elif pvp < 2: score += 8
+        elif pvp > 3: score -= 10
 
+    # DIVIDENDOS (30)  <<<<<< AJUSTE PRINCIPAL
     if dy:
-        score += 20 if dy > 8 else 15 if dy > 6 else 10 if dy > 4 else 0
+        if dy > 10: score += 30
+        elif dy > 8: score += 25
+        elif dy > 6: score += 20
+        elif dy > 4: score += 12
+        elif dy > 2: score += 6
+        else: score += 2
 
     return max(0, min(100, score))
 
 def ajuste_setor(row, score):
-    ticker = row.get("Ticker")
-    setor = SETOR_MAP.get(ticker, "Outro")
+    setor = SETOR_MAP.get(row.get("Ticker"), "Outro")
     regras = PESO_SETOR.get(setor, {})
 
-    roe = row.get("ROE (%)")
-    pvp = row.get("P/VP")
+    roe, pvp = row.get("ROE (%)"), row.get("P/VP")
 
-    if roe and roe >= regras.get("roe_min", 0):
-        score += 5
-    else:
-        score -= 5
-
-    if pvp and pvp <= regras.get("pvp_max", 10):
-        score += 5
-    else:
-        score -= 5
+    score += 5 if roe and roe >= regras.get("roe_min", 0) else -5
+    score += 5 if pvp and pvp <= regras.get("pvp_max", 10) else -5
 
     return max(0, min(100, score)), setor
 
@@ -243,17 +261,13 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # ================== FIX SCHEMA ==================
-    colunas = [
-        "Ticker","Margem Líquida (%)","ROE (%)","P/VP",
-        "Div Yield 12M (%)","Status","Erro","Atualizado em"
-    ]
-
+    # FIX SCHEMA
+    colunas = ["Ticker","Margem Líquida (%)","ROE (%)","P/VP","Div Yield 12M (%)","Status","Erro","Atualizado em"]
     for c in colunas:
         if c not in df.columns:
             df[c] = None
 
-    # ================== ENGINE ==================
+    # ENGINE
     df["Valido"] = df.apply(filtro, axis=1)
     df["Score Base"] = df.apply(lambda r: score_base(r) if r["Valido"] else 0, axis=1)
 
@@ -267,13 +281,14 @@ def main():
     df = sanitize(df)
     df = df.sort_values(by="Score Final", ascending=False)
 
-    # ================== WRITE ==================
+    # WRITE
     data = [df.columns.tolist()] + df.values.tolist()
     sheet_dados.batch_clear(["A1:Z1000"])
     sheet_dados.update("A1", data)
 
     save_cache(cache)
-    log("✅ FINALIZADO SEM ERROS")
+
+    log("✅ FINALIZADO")
 
 if __name__ == "__main__":
     main()
