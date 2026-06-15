@@ -9,6 +9,7 @@ import os
 import requests
 from datetime import datetime
 from google.oauth2.service_account import Credentials
+import google.auth.transport.urllib3 # <--- Força o Google a usar transporte isolado
 
 # ================== CONFIG ==================
 SHEET_ID = "1saHSvkcUV7FUbYaJWJUtC6LBH2svMBOs-5kd8TMGpFU"
@@ -29,32 +30,34 @@ def log(msg):
 
 # ================== FUNÇÃO PARA CONEXÃO COM O GOOGLE ==================
 def conectar_google_sheets(nome_aba):
-    """Autentica no Google usando a string limpa direto da memória ou arquivo local."""
+    """Autentica isolando o transporte para o requests não estragar o login."""
     json_env = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     
     if not json_env:
-        # Se rodar localmente, tenta ler o arquivo físico
         if os.path.exists('credentials.json'):
             with open('credentials.json', 'r') as f:
                 info_credenciais = json.load(f)
         else:
-            raise ValueError("Credenciais do Google não encontradas no ambiente e nem em 'credentials.json'")
+            raise ValueError("Credenciais do Google não encontradas.")
     else:
         info_credenciais = json.loads(json_env)
 
-    # Autentica direto pela memória para evitar erros de encoding no GitHub Actions
     creds = Credentials.from_service_account_info(info_credenciais, scopes=SCOPES)
-    client = gspread.authorize(creds)
+    
+    # ISSO AQUI BLINDA O LOGIN: Força o gspread a autenticar via urllib3 pura,
+    # ignorando qualquer alteração que o requests/yfinance façam no ambiente global.
+    http_client = google.auth.transport.urllib3.AuthorizedHttp(creds)
+    client = gspread.Client(auth=creds, http_client=http_client)
+    
     spreadsheet = client.open_by_key(SHEET_ID)
     return spreadsheet.worksheet(nome_aba)
 
 # ================== FUNÇÃO PARA GERAR SESSÃO ISOLADA ==================
 def criar_sessao_yahoo():
-    """Gera uma sessão nova e limpa simulando um navegador real."""
     sessao = requests.Session()
     sessao.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive'
     })
@@ -89,7 +92,6 @@ def fetch_ticker_data(ticker):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # Pausa curta e dinâmica entre 2 e 4 segundos para evitar bloqueios por IP
             wait_time = random.uniform(2.0, 4.0)
             time.sleep(wait_time)
             
@@ -130,7 +132,6 @@ def main():
     start_time = time.time()
     log("Iniciando atualização diária...")
 
-    # Conexão 1: Lê os tickers de forma isolada e fecha a sessão do Google
     log("Lendo tickers da planilha...")
     sheet_acoes = conectar_google_sheets(TICKERS_SHEET)
     coluna_tickers = sheet_acoes.col_values(1)
@@ -142,24 +143,20 @@ def main():
 
     log(f"Processando {len(tickers)} ativos sequencialmente fora da conexão do Sheets...")
 
-    # Realiza toda a extração de forma sequencial com intervalos anti-bloqueio
     results = []
     for ticker in tickers:
         res = fetch_ticker_data(ticker)
         results.append(res)
 
-    # Processamento dos resultados no DataFrame
     df_resultado = pd.DataFrame(results)
     df_resultado['Ticker'] = pd.Categorical(df_resultado['Ticker'], categories=tickers, ordered=True)
     df_resultado = df_resultado.sort_values('Ticker').reset_index(drop=True)
     df_resultado = df_resultado.replace([np.inf, -np.inf], np.nan).fillna("")
 
-    # Formata a matriz para envio ao Google Sheets
     header = df_resultado.columns.tolist()
     rows = df_resultado.values.tolist()
     data_to_write = [header] + rows
 
-    # Conexão 2: Abre uma nova conexão fresca apenas para despejar a matriz final
     log(f"Abrindo nova conexão para gravar dados na aba '{DATA_SHEET}'...")
     sheet_dados = conectar_google_sheets(DATA_SHEET)
     sheet_dados.clear()
