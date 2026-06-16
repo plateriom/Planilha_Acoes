@@ -10,6 +10,7 @@ import re
 import html as html_lib
 import requests
 import math
+import unicodedata
 
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,7 +34,7 @@ RATE_LIMIT = 2.2
 
 CACHE_FILE = "cache_fiis.json"
 CACHE_TTL = 60 * 60 * 6
-CACHE_SCHEMA_VERSION = 200
+CACHE_SCHEMA_VERSION = 300
 CLEAR_RANGE = "A1:AB1000"
 
 SCOPES = [
@@ -227,6 +228,14 @@ def sanitize_ticker(raw):
     return re.sub(r"[^A-Z0-9]", "", ticker)
 
 
+def normalize_label(value):
+    value = str(value or "").strip().lower()
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def parse_br_number(value):
     if value is None:
         return None
@@ -346,26 +355,24 @@ def first_number(text, patterns, minimum=None, maximum=None):
     return None
 
 
-def extract_investidor10_card_value(raw_html, wanted_labels):
-    if not BeautifulSoup:
-        return None
+# ================== INVESTIDOR10 HTML EXTRACTORS ==================
 
-    if not raw_html:
+def extract_investidor10_card_value(raw_html, wanted_labels):
+    if not BeautifulSoup or not raw_html:
         return None
 
     if isinstance(wanted_labels, str):
         wanted_labels = [wanted_labels]
 
-    wanted_labels_norm = [str(label).strip().lower() for label in wanted_labels]
+    wanted_labels_norm = [normalize_label(label) for label in wanted_labels]
     soup = BeautifulSoup(raw_html, "html.parser")
 
     headers = soup.select("._card-header")
 
     for header in headers:
-        header_text = header.get_text(" ", strip=True)
-        header_norm = header_text.lower()
+        header_text = normalize_label(header.get_text(" ", strip=True))
 
-        if not any(label in header_norm for label in wanted_labels_norm):
+        if not any(label in header_text for label in wanted_labels_norm):
             continue
 
         parent = header.parent
@@ -383,6 +390,87 @@ def extract_investidor10_card_value(raw_html, wanted_labels):
 
         if value is not None:
             return value
+
+    return None
+
+
+def extract_investidor10_info_item_value(raw_html, wanted_labels, prefer_money=False, prefer_percent=False):
+    """
+    Extrai valores de blocos do Investidor10 com estrutura parecida com:
+    <span class="content--info--item--title">YIELD 12 MESES</span>
+
+    Para Rendimentos 12M, use prefer_money=True.
+    Para percentual, use prefer_percent=True.
+    """
+    if not BeautifulSoup or not raw_html:
+        return None
+
+    if isinstance(wanted_labels, str):
+        wanted_labels = [wanted_labels]
+
+    wanted_labels_norm = [normalize_label(label) for label in wanted_labels]
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    candidates = []
+    candidates.extend(soup.select("span.content--info--item--title"))
+    candidates.extend(soup.select(".content--info--item--title"))
+
+    # Fallback: caso a classe venha composta/dinâmica, procura spans/divs cujo texto seja o label.
+    for tag in soup.find_all(["span", "div", "p"]):
+        tag_text_norm = normalize_label(tag.get_text(" ", strip=True))
+        if any(label == tag_text_norm or label in tag_text_norm for label in wanted_labels_norm):
+            candidates.append(tag)
+
+    seen = set()
+
+    for title_tag in candidates:
+        tag_id = id(title_tag)
+        if tag_id in seen:
+            continue
+        seen.add(tag_id)
+
+        title_text_norm = normalize_label(title_tag.get_text(" ", strip=True))
+
+        if not any(label in title_text_norm for label in wanted_labels_norm):
+            continue
+
+        search_blocks = []
+
+        if title_tag.parent:
+            search_blocks.append(title_tag.parent)
+            if title_tag.parent.parent:
+                search_blocks.append(title_tag.parent.parent)
+
+        next_sibling = title_tag.find_next_sibling()
+        if next_sibling:
+            search_blocks.append(next_sibling)
+
+        for block in search_blocks:
+            block_text = block.get_text(" ", strip=True)
+            title_text = title_tag.get_text(" ", strip=True)
+            value_text = block_text.replace(title_text, " ").strip()
+
+            if prefer_money:
+                money_match = re.search(rf"R\$\s*{NUM}", value_text, flags=re.I | re.S)
+                if money_match:
+                    value = plausible(money_match.group(1), 0, 10000)
+                    if value is not None:
+                        return value
+
+            if prefer_percent:
+                percent_match = re.search(rf"{NUM}\s*%", value_text, flags=re.I | re.S)
+                if percent_match:
+                    value = plausible(percent_match.group(1), 0, 100)
+                    if value is not None:
+                        return value
+
+            # Último fallback no bloco: primeiro número plausível.
+            number_match = re.search(NUM, value_text, flags=re.I | re.S)
+            if number_match:
+                max_value = 100 if prefer_percent else 10000
+                value = plausible(number_match.group(1), 0, max_value)
+                if value is not None:
+                    return value
 
     return None
 
@@ -442,8 +530,32 @@ def extract_dy_12m(text, ticker=None, raw_html=None, fonte=None):
     return first_number(text, patterns, 0.01, 100)
 
 
-def extract_rendimentos_12m(text):
+def extract_rendimentos_12m(text, raw_html=None, fonte=None):
+    fonte_norm = str(fonte or "").strip().lower()
+
+    # Estratégia principal: Investidor10, item específico informado pelo usuário.
+    if raw_html and "investidor10" in fonte_norm:
+        item_value = extract_investidor10_info_item_value(
+            raw_html,
+            [
+                "yield 12 meses",
+                "yields 12 meses",
+                "rendimentos 12 meses",
+                "rendimento 12 meses",
+                "ultimos 12 meses",
+                "últimos 12 meses",
+            ],
+            prefer_money=True,
+        )
+        item_value = plausible(item_value, 0, 1000)
+
+        if item_value is not None and item_value > 0:
+            return item_value
+
+    # Fallback textual conservador, sem Status Invest.
     patterns = [
+        rf"YIELD\s*12\s*MESES.{{0,80}}?R\$\s*{NUM}",
+        rf"YIELD\s*12\s*MESES.{{0,80}}?{NUM}",
         rf"Últimos 12 meses\s*R\$\s*{NUM}",
         rf"Ultimos 12 meses\s*R\$\s*{NUM}",
         rf"Últimos\s+12\s+meses\s*R\$\s*{NUM}",
@@ -546,7 +658,7 @@ def parse_source(ticker, text, fonte, raw_html=None):
         "Ticker": ticker,
         "Preço Atual": extract_price(text, ticker, raw_html=raw_html, fonte=fonte),
         "Dividend Yield 12M (%)": extract_dy_12m(text, ticker=ticker, raw_html=raw_html, fonte=fonte),
-        "Rendimentos 12M": extract_rendimentos_12m(text),
+        "Rendimentos 12M": extract_rendimentos_12m(text, raw_html=raw_html, fonte=fonte),
         "P/VP": extract_pvp(text, raw_html=raw_html, fonte=fonte),
         "Último Rendimento": extract_ultimo_rendimento(text, ticker),
         "Fonte": fonte,
@@ -570,29 +682,30 @@ def parse_source(ticker, text, fonte, raw_html=None):
     return data
 
 
-# ================== FETCH SOURCES ==================
+# ================== FETCH SOURCE ==================
 
-def fetch_source(ticker, fonte, url):
+def fetch_investidor10(ticker):
+    url = f"https://investidor10.com.br/fiis/{ticker.lower()}/"
     last_error = None
 
     for attempt in range(MAX_RETRIES):
         try:
             rate_limiter()
 
-            log_ticker(ticker, fonte.upper(), f"TENTATIVA {attempt + 1}/{MAX_RETRIES}", url)
+            log_ticker(ticker, "INVESTIDOR10", f"TENTATIVA {attempt + 1}/{MAX_RETRIES}", url)
 
             response = requests.get(url, headers=build_headers(), timeout=25)
 
-            log_ticker(ticker, fonte.upper(), f"HTTP {response.status_code}")
+            log_ticker(ticker, "INVESTIDOR10", f"HTTP {response.status_code}")
 
             if response.status_code in [403, 429]:
                 raise Exception(f"bloqueio/rate limit HTTP {response.status_code}")
 
             if response.status_code == 404:
-                raise Exception(f"FII não encontrado no {fonte}")
+                raise Exception("FII não encontrado no Investidor10")
 
             if response.status_code == 410:
-                raise Exception(f"FII indisponível/removido no {fonte} HTTP 410")
+                raise Exception("FII indisponível/removido no Investidor10 HTTP 410")
 
             response.raise_for_status()
 
@@ -600,15 +713,15 @@ def fetch_source(ticker, fonte, url):
             text = html_to_text(raw_html)
 
             if not page_has_ticker(ticker, text):
-                raise Exception(f"HTML do {fonte} não corresponde ao ticker solicitado")
+                raise Exception("HTML do Investidor10 não corresponde ao ticker solicitado")
 
-            data = parse_source(ticker, text, fonte, raw_html=raw_html)
+            data = parse_source(ticker, text, "Investidor10", raw_html=raw_html)
             valid_count = count_valid_fields(data)
 
             if data["Status"] == "OK":
                 log_ticker(
                     ticker,
-                    fonte.upper(),
+                    "INVESTIDOR10",
                     "OK",
                     f"preço={data.get('Preço Atual')} | "
                     f"DY={data.get('Dividend Yield 12M (%)')} | "
@@ -619,7 +732,7 @@ def fetch_source(ticker, fonte, url):
                 return data, valid_count, None
 
             if data["Status"] == "PARCIAL":
-                log_ticker(ticker, fonte.upper(), "PARCIAL", f"{valid_count} campos capturados")
+                log_ticker(ticker, "INVESTIDOR10", "PARCIAL", f"{valid_count} campos capturados")
                 return data, valid_count, data.get("Erro")
 
             raise Exception(data.get("Erro") or "nenhum indicador útil capturado")
@@ -628,132 +741,17 @@ def fetch_source(ticker, fonte, url):
             last_error = str(e)
 
             if "HTTP 410" in last_error or "não encontrado" in last_error:
-                log_ticker(ticker, fonte.upper(), "FALHOU SEM RETRY", last_error)
+                log_ticker(ticker, "INVESTIDOR10", "FALHOU SEM RETRY", last_error)
                 break
 
             if attempt < MAX_RETRIES - 1:
                 sleep_time = (3 ** attempt) + random.uniform(1, 2)
-                log_ticker(ticker, fonte.upper(), "RETRY", f"{last_error} | aguardando {round(sleep_time, 1)}s")
+                log_ticker(ticker, "INVESTIDOR10", "RETRY", f"{last_error} | aguardando {round(sleep_time, 1)}s")
                 time.sleep(sleep_time)
             else:
-                log_ticker(ticker, fonte.upper(), "FALHOU", last_error)
+                log_ticker(ticker, "INVESTIDOR10", "FALHOU", last_error)
 
     return None, 0, last_error
-
-
-def fetch_investidor10(ticker):
-    return fetch_source(
-        ticker,
-        "Investidor10",
-        f"https://investidor10.com.br/fiis/{ticker.lower()}/"
-    )
-
-
-def fetch_statusinvest(ticker):
-    return fetch_source(
-        ticker,
-        "StatusInvest",
-        f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
-    )
-
-
-def fetch_statusinvest_rendimentos_12m(ticker):
-    url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            rate_limiter()
-
-            log_ticker(
-                ticker,
-                "STATUSINVEST_SUPLEMENTO",
-                f"TENTATIVA {attempt + 1}/{MAX_RETRIES}",
-                "buscando apenas Rendimentos 12M"
-            )
-
-            response = requests.get(url, headers=build_headers(), timeout=25)
-
-            log_ticker(ticker, "STATUSINVEST_SUPLEMENTO", f"HTTP {response.status_code}")
-
-            if response.status_code in [403, 429]:
-                raise Exception(f"bloqueio/rate limit HTTP {response.status_code}")
-
-            if response.status_code == 404:
-                raise Exception("FII não encontrado no Status Invest")
-
-            if response.status_code == 410:
-                raise Exception("FII indisponível/removido no Status Invest HTTP 410")
-
-            response.raise_for_status()
-
-            text = html_to_text(response.text)
-
-            if not page_has_ticker(ticker, text):
-                raise Exception("HTML do Status Invest não corresponde ao ticker solicitado")
-
-            rendimentos_12m = extract_rendimentos_12m(text)
-
-            if rendimentos_12m is not None and rendimentos_12m > 0:
-                log_ticker(
-                    ticker,
-                    "STATUSINVEST_SUPLEMENTO",
-                    "OK",
-                    f"Rendimentos 12M={rendimentos_12m}"
-                )
-                return rendimentos_12m, None
-
-            raise Exception("Rendimentos 12M não encontrado no Status Invest")
-
-        except Exception as e:
-            last_error = str(e)
-
-            if "HTTP 410" in last_error or "não encontrado" in last_error:
-                log_ticker(ticker, "STATUSINVEST_SUPLEMENTO", "FALHOU SEM RETRY", last_error)
-                break
-
-            if attempt < MAX_RETRIES - 1:
-                sleep_time = (3 ** attempt) + random.uniform(1, 2)
-                log_ticker(
-                    ticker,
-                    "STATUSINVEST_SUPLEMENTO",
-                    "RETRY",
-                    f"{last_error} | aguardando {round(sleep_time, 1)}s"
-                )
-                time.sleep(sleep_time)
-            else:
-                log_ticker(ticker, "STATUSINVEST_SUPLEMENTO", "FALHOU", last_error)
-
-    return None, last_error
-
-
-def complementar_rendimentos_12m_se_ausente(ticker, data):
-    if not data:
-        return data
-
-    atual = data.get("Rendimentos 12M")
-
-    if atual is not None and atual != "" and float(atual) > 0:
-        return data
-
-    rendimentos_12m, erro = fetch_statusinvest_rendimentos_12m(ticker)
-
-    if rendimentos_12m is not None and rendimentos_12m > 0:
-        data["Rendimentos 12M"] = rendimentos_12m
-
-        fonte_atual = str(data.get("Fonte") or "")
-        if "StatusInvest_R12M" not in fonte_atual:
-            data["Fonte"] = f"{fonte_atual}+StatusInvest_R12M" if fonte_atual else "StatusInvest_R12M"
-
-        log_ticker(ticker, "SUPLEMENTO", "RENDIMENTOS 12M INSERIDO", str(rendimentos_12m))
-        return data
-
-    erro_atual = str(data.get("Erro") or "").strip()
-    complemento = f"Rendimentos 12M ausente; suplemento StatusInvest falhou: {erro}"
-    data["Erro"] = f"{erro_atual} | {complemento}" if erro_atual else complemento
-
-    log_ticker(ticker, "SUPLEMENTO", "RENDIMENTOS 12M AUSENTE", str(erro))
-    return data
 
 
 # ================== FETCH TICKER ==================
@@ -776,58 +774,13 @@ def fetch_ticker(ticker):
         )
         return normalize_result(cached)
 
-    best_partial = None
-    best_partial_count = 0
-    errors = []
+    data, count, error = fetch_investidor10(ticker)
 
-    i10_data, i10_count, i10_error = fetch_investidor10(ticker)
+    if data and data.get("Status") in ["OK", "PARCIAL"]:
+        set_cache(ticker, data)
+        return normalize_result(data)
 
-    if i10_data and i10_data.get("Status") == "OK":
-        i10_data = complementar_rendimentos_12m_se_ausente(ticker, i10_data)
-        set_cache(ticker, i10_data)
-        return normalize_result(i10_data)
-
-    if i10_data and i10_count > best_partial_count:
-        best_partial = i10_data
-        best_partial_count = i10_count
-
-    if i10_error:
-        errors.append(f"Investidor10: {i10_error}")
-
-    log_ticker(ticker, "FALLBACK", "ACIONANDO STATUSINVEST", "Investidor10 insuficiente ou indisponível")
-
-    si_data, si_count, si_error = fetch_statusinvest(ticker)
-
-    if si_data and si_data.get("Status") == "OK":
-        si_data = complementar_rendimentos_12m_se_ausente(ticker, si_data)
-        set_cache(ticker, si_data)
-        return normalize_result(si_data)
-
-    if si_data and si_count > best_partial_count:
-        best_partial = si_data
-        best_partial_count = si_count
-
-    if si_error:
-        errors.append(f"StatusInvest: {si_error}")
-
-    if best_partial and best_partial_count > 0:
-        best_partial["Status"] = "PARCIAL"
-        best_partial["Erro"] = " | ".join(errors) if errors else "dados parciais"
-        best_partial = complementar_rendimentos_12m_se_ausente(ticker, best_partial)
-        best_partial = clean_for_json(best_partial)
-
-        log_ticker(
-            ticker,
-            "FINAL",
-            "PARCIAL",
-            f"{best_partial_count} campos reais capturados; sem dados inventados"
-        )
-
-        set_cache(ticker, best_partial)
-        return normalize_result(best_partial)
-
-    error_msg = " | ".join(errors) if errors else "nenhuma fonte retornou dados reais"
-
+    error_msg = f"Investidor10: {error}" if error else "Investidor10 não retornou dados reais"
     log_ticker(ticker, "FINAL", "ERRO", error_msg)
 
     return empty_result(ticker=ticker, status="ERRO", erro=error_msg, fonte=None)
@@ -923,8 +876,9 @@ def main():
 
     log(f"FIIs | {len(tickers)} ativos encontrados")
     log("ORDEM | a ordem da aba FIIs será preservada na aba FIIs Dados")
-    log("ORDEM DE FONTES | 1º Investidor10 | 2º Status Invest | suplemento R12M via Status Invest")
+    log("FONTE | Investidor10 somente; Status Invest desativado")
     log("COLUNAS | Ticker, Preço, DY, Rendimentos 12M, P/VP, Último Rendimento")
+    log("R12M | estratégia Investidor10: span.content--info--item--title = YIELD 12 MESES")
     log(f"CACHE | arquivo: {CACHE_FILE}")
     log(f"CACHE | TTL configurado: {round(CACHE_TTL / 3600, 1)} horas")
     log(f"CACHE | schema version exigido: {CACHE_SCHEMA_VERSION}")
