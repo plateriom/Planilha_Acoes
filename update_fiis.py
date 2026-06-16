@@ -642,10 +642,8 @@ def fetch_statusinvest_rendimentos_12m(ticker):
                     ticker,
                     "STATUSINVEST_SUPLEMENTO",
                     "OK",
-def fetch_statusinvest_rendimentos_12m(ticker):
-    """
-    Busca}"    Busca exclusivamente o campo Rendimentos 12M no Status Invest.
-                )
+    def fetch_statusinvest_rendimentos_12m(ticker):
+       
                 return rendimentos_12m, None
 
             raise Exception("Rendimentos 12M não encontrado no Status Invest")
