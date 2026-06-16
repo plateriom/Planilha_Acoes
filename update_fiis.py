@@ -680,10 +680,7 @@ def fetch_statusinvest_rendimentos_12m(ticker):
                 )
 
     return None, last_error
-
-    Esta função não substitui preço, DY, P/VP nem último rendimento.
-    Ela serve apenas para complementar o dado ausente.
-    """
+   
     url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
     last_error = None
 
